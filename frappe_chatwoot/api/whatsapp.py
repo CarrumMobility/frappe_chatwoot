@@ -175,14 +175,18 @@ def send_message(conversation_id: int, content: str) -> dict:
     return resp.json()
 
 
-def get_messages(conversation_id: int) -> list[dict]:
+def get_messages(conversation_id: int, before_msg_id: str | int = None) -> list[dict]:
     """
     List all messages of a conversation.
     API: GET /api/v1/accounts/{account_id}/conversations/{conversation_id}/messages
     https://developers.chatwoot.com/api-reference/messages/get-messages
     Returns the payload array of message objects.
     """
-    url = f"{CHATWOOT_BASE}/accounts/{CHATWOOT_ACC_ID}/conversations/{conversation_id}/messages"
+
+    url = f"{CHATWOOT_BASE}/accounts/{CHATWOOT_ACC_ID}/conversations/{conversation_id}/messages?"
+    if before_msg_id:
+        url += f"&before={before_msg_id}"
+    print("URL: ", url)
     resp = requests.get(url, headers=_HEADERS)
     resp.raise_for_status()
     data = resp.json()
@@ -214,16 +218,29 @@ def get_whatsapp_messages(reference_doctype: str, reference_name: str):
 
     # find conversations for this contact, then filter by WhatsApp inbox
     conversations = get_conversation(contactInfo["contact_id"])
-    if not conversations:
+    if not conversations or len(conversations) == 0:
         return []
+
     conversations = [c for c in conversations if c.get("inbox_id") == CHATWOOT_DIPESH_ACC_INBOX_ID]
+    conversations = [conversations[0]]
     all_messages = []
+    lastMsgId = None
     for conversation in conversations:
         conversation_id = conversation.get("id")
         if not conversation_id:
             continue
-        raw_messages = get_messages(conversation_id)
-        all_messages.extend(raw_messages)
+        while(True):
+            print("Previous Message Id: ", lastMsgId)
+            raw_messages = get_messages(conversation_id, before_msg_id=lastMsgId)
+            print("Raw Messages: ", raw_messages)
+            if len(raw_messages) == 0:
+                break
+            if(len(raw_messages) > 0):
+                print("New Message Id: ", raw_messages[0].get("id"))
+                lastMsgId = raw_messages[0].get("id")
+            else:
+                break
+            all_messages.extend(raw_messages)
     data = []
     for msg in all_messages:
         sender = msg.get("sender")
@@ -268,7 +285,6 @@ def get_whatsapp_messages(reference_doctype: str, reference_name: str):
             "from_name": from_name or "Administrator",
         })
     
-    print('data: ',json.dumps(data))
     return data
 
 @frappe.whitelist()

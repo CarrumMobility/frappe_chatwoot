@@ -1,7 +1,7 @@
 [project]
 name = "frappe_chatwoot"
 authors = [
-    { name = "kapil.rohilla@carrum.co.in", email = "kapil.rohilla@carrum.co.in"}
+    { name = "kapil rohilla", email = "kapil.rohilla@carrum.co.in"}
 ]
 description = "Frappe CRM Chatwoot integration"
 requires-python = ">=3.14"
