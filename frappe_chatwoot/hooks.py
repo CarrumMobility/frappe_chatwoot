@@ -182,7 +182,8 @@ override_whitelisted_methods = {
 	"crm.api.whatsapp.is_whatsapp_enabled": "frappe_chatwoot.api.whatsapp.is_whatsapp_enabled",
 	"crm.api.whatsapp.is_whatsapp_installed": "frappe_chatwoot.api.whatsapp.is_whatsapp_installed",
 	"crm.api.whatsapp.create_whatsapp_message": "frappe_chatwoot.api.whatsapp.create_whatsapp_message",
-	"crm.api.whatsapp.get_whatsapp_messages": "frappe_chatwoot.api.whatsapp.get_whatsapp_messages"
+	"crm.api.whatsapp.get_whatsapp_messages": "frappe_chatwoot.api.whatsapp.get_whatsapp_messages",
+	"crm.api.whatsapp.send_whatsapp_template": "frappe_chatwoot.api.whatsapp.send_whatsapp_template"
 }
 #
 # each overriding function accepts a `data` argument;

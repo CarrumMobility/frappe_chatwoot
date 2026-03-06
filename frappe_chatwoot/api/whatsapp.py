@@ -1,5 +1,6 @@
 import json
 import random
+import re
 import frappe
 import requests
 from datetime import datetime
@@ -49,10 +50,6 @@ Agent - [
 ]
 '''
 
-# Example usage
-# CRM_LEAD_ID = "LEAD-00045"
-# INBOX_HMAC_KEY = "your_chatwoot_inbox_hmac_token_here"
-
 def _sanitize_phone(phoneNo: str):
     if len(phoneNo) == 10:
         return phoneNo
@@ -61,10 +58,31 @@ def _sanitize_phone(phoneNo: str):
     return phoneNo.replace("+91", "")
 
 
-def get_or_create_contact(phone_no: str) -> dict:
+def _parse_contact_info(contact: dict) -> dict:
+    """Extract contact_id, inbox_id, source_id from a contact payload (with contact_inboxes)."""
+    contact_id = contact["id"]
+    contact_inboxes = contact.get("contact_inboxes") or []
+    whatsapp_inbox = next(
+        (
+            ci
+            for ci in contact_inboxes
+            if (ci.get("inbox") or {}).get("channel_type") == "Channel::Whatsapp"
+        ),
+        contact_inboxes[0] if contact_inboxes else None,
+    )
+    if not whatsapp_inbox:
+        raise Exception("Contact has no WhatsApp inbox")
+    return {
+        "contact_id": contact_id,
+        "inbox_id": whatsapp_inbox["inbox"]["id"],
+        "source_id": whatsapp_inbox["source_id"],
+    }
+
+
+def find_contact(phone_no: str) -> dict:
     """
-    Search contact by phone; create if not found. Returns contact_id, inbox_id, source_id
-    for the WhatsApp channel.
+    Search contact by phone; do not create. Returns contact_id, inbox_id, source_id
+    for the WhatsApp channel. Raises if not found or multiple matches.
     """
     search_url = f"{CHATWOOT_BASE}/accounts/{CHATWOOT_ACC_ID}/contacts/search?page=1&q={phone_no}"
     resp = requests.get(search_url, headers=_HEADERS)
@@ -73,49 +91,42 @@ def get_or_create_contact(phone_no: str) -> dict:
     payload = data.get("payload") or []
 
     if len(payload) == 0:
-        create_url = f"{CHATWOOT_BASE}/accounts/{CHATWOOT_ACC_ID}/contacts"
-        create_resp = requests.post(
-            create_url,
-            headers=_HEADERS,
-            json={
-                "inbox_id": CHATWOOT_DIPESH_ACC_INBOX_ID,
-                "phone_number": f"+91{phone_no}",
-                "name": phone_no,
-                "identifier": phone_no,
-            },
-        )
-        create_resp.raise_for_status()
-        created = create_resp.json()
-        contact_obj = created.get("payload", created)
-        if isinstance(contact_obj, list):
-            contact_obj = contact_obj[0]
-        contact_id = contact_obj["id"]
-        contact_inboxes = contact_obj.get("contact_inboxes") or []
-        if not contact_inboxes:
-            raise Exception("Created contact has no contact_inboxes")
-        source_id = contact_inboxes[0]["source_id"]
-        inbox_id = contact_inboxes[0]["inbox"]["id"]
-        return {"contact_id": contact_id, "inbox_id": inbox_id, "source_id": source_id}
+        raise Exception(f"Contact not found for phone {phone_no}")
+    if len(payload) > 1:
+        raise Exception("Multiple contacts found for this phone number")
+    return _parse_contact_info(payload[0])
 
-    if len(payload) == 1:
-        contact = payload[0]
-        contact_id = contact["id"]
-        contact_inboxes = contact.get("contact_inboxes") or []
-        whatsapp_inbox = next(
-            (
-                ci
-                for ci in contact_inboxes
-                if (ci.get("inbox") or {}).get("channel_type") == "Channel::Whatsapp"
-            ),
-            contact_inboxes[0] if contact_inboxes else None,
-        )
-        if not whatsapp_inbox:
-            raise Exception("Contact has no WhatsApp inbox")
-        source_id = whatsapp_inbox["source_id"]
-        inbox_id = whatsapp_inbox["inbox"]["id"]
-        return {"contact_id": contact_id, "inbox_id": inbox_id, "source_id": source_id}
 
-    raise Exception("Multiple contacts found for this phone number")
+def get_or_create_contact(phone_no: str) -> dict:
+    """
+    Search contact by phone; create if not found. Returns contact_id, inbox_id, source_id
+    for the WhatsApp channel.
+    """
+    try:
+        return find_contact(phone_no)
+    except Exception as e:
+        if "Contact not found" not in str(e):
+            raise
+    create_url = f"{CHATWOOT_BASE}/accounts/{CHATWOOT_ACC_ID}/contacts"
+    create_resp = requests.post(
+        create_url,
+        headers=_HEADERS,
+        json={
+            "inbox_id": CHATWOOT_DIPESH_ACC_INBOX_ID,
+            "phone_number": f"+91{phone_no}",
+            "name": phone_no,
+            "identifier": phone_no,
+        },
+    )
+    create_resp.raise_for_status()
+    created = create_resp.json()
+    contact_obj = created.get("payload", created)
+    if isinstance(contact_obj, list):
+        contact_obj = contact_obj[0]
+    contact_inboxes = contact_obj.get("contact_inboxes") or []
+    if not contact_inboxes:
+        raise Exception("Created contact has no contact_inboxes")
+    return _parse_contact_info(contact_obj)
 
 
 def get_conversation(contact_id: int) -> list | None:
@@ -149,6 +160,18 @@ def create_conversation(
     return conv_data["id"]
 
 
+def find_conversation(contact_id: int, inbox_id: int) -> dict:
+    """
+    Find an existing conversation for this contact in the given inbox.
+    Returns the conversation dict (includes id, can_reply, etc.). Raises if no conversation found.
+    """
+    conversations = get_conversation(contact_id)
+    by_inbox = [c for c in conversations if c.get("inbox_id") == inbox_id]
+    if not by_inbox:
+        raise Exception("No conversation found for this contact in the given inbox")
+    return by_inbox[0]
+
+
 def get_or_create_conversation(
     contact_id: int,
     inbox_id: int,
@@ -160,17 +183,47 @@ def get_or_create_conversation(
     Returns conversation_id.
     """
     conversations = get_conversation(contact_id)
-    if conversations:
-        conversation_id = conversations[0]["id"]
-        return conversation_id
-    else:
-        return create_conversation(contact_id, inbox_id, source_id, initial_message)
+    by_inbox = [c for c in conversations if c.get("inbox_id") == inbox_id]
+    if by_inbox:
+        return by_inbox[0]["id"]
+    return create_conversation(contact_id, inbox_id, source_id, initial_message)
 
 
 def send_message(conversation_id: int, content: str) -> dict:
     """Send a message in an existing conversation. Returns the message response."""
     url = f"{CHATWOOT_BASE}/accounts/{CHATWOOT_ACC_ID}/conversations/{conversation_id}/messages"
     resp = requests.post(url, headers=_HEADERS, json={"content": content})
+    resp.raise_for_status()
+    return resp.json()
+
+
+def send_template_message(
+    conversation_id: int,
+    template_name: str,
+    content: str,
+    body_params: dict | None = None,
+    category: str = "UTILITY",
+    language: str = "en",
+) -> dict:
+    """
+    Send a WhatsApp template message in an existing conversation.
+    body_params: map of variable index to value, e.g. {"1": "val1", "2": "val2"}.
+    Returns the message response.
+    """
+    body_params = body_params or {}
+    payload = {
+        "content": content,
+        "template_params": {
+            "name": template_name,
+            "category": category,
+            "language": language,
+            "processed_params": {
+                "body": body_params,
+            },
+        },
+    }
+    url = f"{CHATWOOT_BASE}/accounts/{CHATWOOT_ACC_ID}/conversations/{conversation_id}/messages"
+    resp = requests.post(url, headers=_HEADERS, json=payload)
     resp.raise_for_status()
     return resp.json()
 
@@ -297,14 +350,13 @@ def create_whatsapp_message(
 	reply_to: str,
 	content_type: str = "text",
 ):
-    """Get or create contact and conversation, then send the message in the same thread."""
+    """Find contact and conversation by phone/inbox, then send the message in that thread."""
     phone_no = _sanitize_phone(to)
-    contact_info = get_or_create_contact(phone_no)
-    conversation_id = get_or_create_conversation(
-        contact_id=contact_info["contact_id"],
-        inbox_id=contact_info["inbox_id"],
-        source_id=contact_info["source_id"],
-    )
+    contact_info = find_contact(phone_no)
+    conversation = find_conversation(contact_info["contact_id"], contact_info["inbox_id"])
+    if conversation.get("can_reply") is False:
+        raise frappe.throw("Send a template message to resume the conversation")
+    conversation_id = conversation["id"]
     msg_response = send_message(conversation_id, message)
     return {
         "contact_id": contact_info["contact_id"],
@@ -318,3 +370,94 @@ def create_whatsapp_message(
 def react_on_whatsapp_message(emoji: str, reply_to_name: str):
     return {}
 
+
+DUMMY_TEMPLATE_VAL = "TEST_VAL"
+
+
+def _parse_body_variable_indices(body_text: str) -> list[int]:
+    """Extract WhatsApp body variable indices from BODY text (e.g. {{1}}, {{2}}). Returns sorted unique indices."""
+    if not body_text:
+        return []
+    matches = re.findall(r"\{\{(\d+)\}\}", body_text)
+    return sorted(set(int(m) for m in matches))
+
+
+def get_template_info(template_name: str, inbox_id: int | None = None) -> dict:
+    """
+    Fetch template by name from Chatwoot inbox API. Validates template exists and
+    returns body variable indices (from BODY component {{1}}, {{2}}, etc.).
+    Returns dict with keys: name, body_variable_indices, language, category.
+    Raises if template not found.
+    """
+    inbox_id = inbox_id or CHATWOOT_DIPESH_ACC_INBOX_ID
+    url = f"{CHATWOOT_BASE}/accounts/{CHATWOOT_ACC_ID}/inboxes/{inbox_id}"
+    resp = requests.get(url, headers=_HEADERS)
+    resp.raise_for_status()
+    data = resp.json()
+    payload = data.get("payload")
+    if isinstance(payload, dict):
+        message_templates = payload.get("message_templates") or []
+    else:
+        message_templates = data.get("message_templates") or []
+
+    for t in message_templates:
+        if t.get("name") == template_name:
+            body_text = ""
+            language = t.get("language", {}).get("code", "en") if isinstance(t.get("language"), dict) else t.get("language") or "en"
+            category = t.get("category", "UTILITY")
+            for comp in t.get("components") or []:
+                if comp.get("type") == "BODY":
+                    body_text = comp.get("text") or ""
+                    break
+            body_variable_indices = _parse_body_variable_indices(body_text)
+            return {
+                "name": template_name,
+                "body_text": body_text,
+                "body_variable_indices": body_variable_indices,
+                "language": language,
+                "category": category,
+            }
+    raise Exception(f"Template not found: {template_name}")
+
+
+def _fill_template_body(body_text: str, body_params: dict) -> str:
+    """Replace {{1}}, {{2}}, ... in body text with values from body_params."""
+    result = body_text
+    for key, value in body_params.items():
+        result = result.replace(f"{{{{{key}}}}}", value)
+    return result
+
+
+@frappe.whitelist()
+def send_whatsapp_template(reference_doctype: str, reference_name: str, template: str, to: str):
+    """
+    Validate template via inbox API, find or create contact and conversation,
+    then send a WhatsApp template message with body variables set to TEST_VAL.
+    """
+    template_info = get_template_info(template)
+    body_variable_indices = template_info["body_variable_indices"]
+    body_params = {str(i): DUMMY_TEMPLATE_VAL for i in body_variable_indices}
+    content = _fill_template_body(template_info.get("body_text", ""), body_params)
+
+    phone_no = _sanitize_phone(to)
+    contact_info = get_or_create_contact(phone_no)
+    conversation_id = get_or_create_conversation(
+        contact_id=contact_info["contact_id"],
+        inbox_id=contact_info["inbox_id"],
+        source_id=contact_info["source_id"],
+    )
+    msg_response = send_template_message(
+        conversation_id=conversation_id,
+        template_name=template,
+        content=content,
+        body_params=body_params,
+        category=str(template_info.get("category", "UTILITY")),
+        language=str(template_info.get("language", "en")),
+    )
+    return {
+        "contact_id": contact_info["contact_id"],
+        "inbox_id": contact_info["inbox_id"],
+        "source_id": contact_info["source_id"],
+        "conversation_id": conversation_id,
+        "message": msg_response,
+    }

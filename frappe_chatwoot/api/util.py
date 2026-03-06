@@ -1,7 +1,41 @@
 import frappe
 import frappe.client as client
-
+import frappe_chatwoot.api.whatsapp as whatsapp
 WHATSAPP_TEMPLATE_DOCTYPE = "WhatsApp Templates";
+import requests
+
+get_inbox_detail = {
+    "url": "https://app.chatwoot.com/api/v1/accounts/153201/inboxes", # Expecting inboxId in the end of url
+    "method": "GET",
+}
+
+def _get_whatsapp_templates():
+    print("GETTING WHATSAPP TEMPLATES")
+    template_list = []
+    url = f'{get_inbox_detail.get("url")}/{whatsapp.CHATWOOT_DIPESH_ACC_INBOX_ID}'
+
+    response = requests.get(url, headers=whatsapp._HEADERS)
+    data = response.json()
+    messageTemplates = data.get("message_templates")
+    for template in messageTemplates:
+        template_name = template.get("name", "")
+        body_text = ""
+        footer_text = ""
+
+        for component in template.get("components", []):
+            if component.get("type") == "BODY":
+                body_text = component.get("text", "")
+            elif component.get("type") == "FOOTER":
+                footer_text = component.get("text", "")
+            elif component.get("type") == "HEADER":
+                footer_text = component.get("text", "")
+
+        template_list.append({
+            "name": template_name,
+            "template": body_text,
+            "footer": footer_text
+        })
+    return template_list
 
 @frappe.whitelist()
 def get_list(
@@ -19,12 +53,7 @@ def get_list(
 	expand: list | None = None,
 ):
     if doctype == WHATSAPP_TEMPLATE_DOCTYPE:
-        message = [{
-            "name": "ASDF_ASDF_ASDF",
-            "template": "Welcome Kapil Rohilla",
-            "footer": "WhatsApp Business "
-        }]
-        return message
+        return _get_whatsapp_templates()
     else:
         return client.get_list(
             doctype=doctype,
