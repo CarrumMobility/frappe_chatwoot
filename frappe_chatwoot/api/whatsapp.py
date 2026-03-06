@@ -283,13 +283,13 @@ def get_whatsapp_messages(reference_doctype: str, reference_name: str):
         if not conversation_id:
             continue
         while(True):
-            print("Previous Message Id: ", lastMsgId)
+            # print("Previous Message Id: ", lastMsgId)
             raw_messages = get_messages(conversation_id, before_msg_id=lastMsgId)
-            print("Raw Messages: ", raw_messages)
+            # print("Raw Messages: ", raw_messages)
             if len(raw_messages) == 0:
                 break
             if(len(raw_messages) > 0):
-                print("New Message Id: ", raw_messages[0].get("id"))
+                # print("New Message Id: ", raw_messages[0].get("id"))
                 lastMsgId = raw_messages[0].get("id")
             else:
                 break
