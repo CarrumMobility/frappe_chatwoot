@@ -1,23 +1,26 @@
 import frappe
 import frappe.client as client
 import frappe_chatwoot.api.whatsapp as whatsapp
-WHATSAPP_TEMPLATE_DOCTYPE = "WhatsApp Templates";
 import requests
 
-get_inbox_detail = {
-    "url": "https://app.chatwoot.com/api/v1/accounts/153201/inboxes", # Expecting inboxId in the end of url
-    "method": "GET",
-}
+WHATSAPP_TEMPLATE_DOCTYPE = "WhatsApp Templates"
+
 
 def _get_whatsapp_templates():
-    print("GETTING WHATSAPP TEMPLATES")
-    template_list = []
-    url = f'{get_inbox_detail.get("url")}/{whatsapp.CHATWOOT_DIPESH_ACC_INBOX_ID}'
-
-    response = requests.get(url, headers=whatsapp._HEADERS)
+    ctx = whatsapp._get_chatwoot_ctx()
+    url = f"{ctx['base_url']}/api/v1/accounts/{ctx['account_id']}/inboxes/{ctx['inbox_id']}"
+    
+    response = requests.get(url, headers=ctx["headers"])
     data = response.json()
-    messageTemplates = data.get("message_templates")
-    for template in messageTemplates:
+
+    payload = data.get("payload")
+    if isinstance(payload, dict):
+        message_templates = payload.get("message_templates") or []
+    else:
+        message_templates = data.get("message_templates") or []
+    
+    template_list = []
+    for template in message_templates:
         template_name = template.get("name", "")
         body_text = ""
         footer_text = ""
