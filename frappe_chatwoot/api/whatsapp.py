@@ -1,10 +1,12 @@
 import random
 import re
 import sys
+from datetime import datetime, timezone
+from urllib.parse import urlencode
+
 from core.api import carrum_accounts
 import frappe
 import requests
-from datetime import datetime
 
 LEAD_DOCTYPE = "CRM Lead"
 FRAPPE_CHATWOOT_MESSAGE_TYPE_MAPPING = {1: "Outgoing", 2: "Incoming"}
@@ -21,7 +23,7 @@ def _get_chatwoot_ctx(username: str | None = None) -> dict | None:
     if account_id is None:
         frappe.throw("Chatwoot account id is not configured (chatwoot_account_id).")
     base_url = (frappe.conf.get("chatwoot_base_url") or "").rstrip("/")
-
+    print('cfg: ' + str(cfg))
     token = (cfg.token or "").strip()
     if not token:
         return None
@@ -74,6 +76,7 @@ def get_whatsapp_messages(reference_doctype: str, reference_name: str):
         return []
 
     conversations = [c for c in conversations if c.get("inbox_id") == ctx["inbox_id"]]
+    print("conversations", str(conversations))
     if not conversations:
         return []
     conversations = [conversations[0]]
@@ -146,18 +149,25 @@ def create_whatsapp_message(
     reply_to: str,
     content_type: str = "text",
 ):
-    """Find contact and conversation by phone/inbox, then send the message in that thread."""
+    """Find or create contact and conversation by phone/inbox, then send the message in that thread."""
     phone_no = _sanitize_phone(to)
     ctx = _get_chatwoot_ctx()
     if ctx is None:
         frappe.throw("Chatwoot is not configured for this user. Check Carrum chatwoot credentials.")
 
-    contact_info = find_contact(phone_no, ctx)
-
-    conversation = find_conversation(contact_info["contact_id"], contact_info["inbox_id"], ctx)
-    if conversation.get("can_reply") is False:
+    contact_info = get_or_create_contact(phone_no, ctx)
+    conversation_id = get_or_create_conversation(
+        contact_id=contact_info["contact_id"],
+        inbox_id=contact_info["inbox_id"],
+        source_id=contact_info["source_id"],
+        ctx=ctx,
+        initial_message=None,
+        phone_number=phone_no,
+    )
+    conversations = get_conversation(contact_info["contact_id"], ctx)
+    conv = next((c for c in conversations if c.get("id") == conversation_id), None)
+    if conv is not None and conv.get("can_reply") is False:
         frappe.throw("Send a template message to resume the conversation")
-    conversation_id = conversation["id"]
 
     msg_response = send_message(conversation_id, message, ctx)
 
@@ -197,6 +207,7 @@ def send_whatsapp_template(reference_doctype: str, reference_name: str, template
         source_id=contact_info["source_id"],
         initial_message=None,
         ctx=ctx,
+        phone_number=phone_no,
     )
     msg_response = send_template_message(
         conversation_id=conversation_id,
@@ -215,10 +226,232 @@ def send_whatsapp_template(reference_doctype: str, reference_name: str, template
         "message": msg_response,
     }
 
+def _format_chat_list_timestamp(value) -> str:
+    """Normalize Chatwoot ISO / unix timestamps to 'YYYY-MM-DD HH:MM:SS' (UTC)."""
+    if value is None:
+        return ""
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(int(value), tz=timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+    if isinstance(value, str) and value.strip():
+        try:
+            s = value.strip().replace("Z", "+00:00")
+            d = datetime.fromisoformat(s)
+            if d.tzinfo:
+                d = d.astimezone(timezone.utc).replace(tzinfo=None)
+            return d.strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return ""
+    return ""
+
+
+def _conversation_to_chat_list_row(conv: dict) -> dict:
+    """
+    Map Chatwoot conversation (payload item) to CRM chat list row for WaChatListModal.
+    """
+    meta = conv.get("meta") or {}
+    sender = meta.get("sender") or {}
+    name = (sender.get("name") or "").strip() or (sender.get("phone_number") or "Unknown")
+    phone = sender.get("phone_number") or ""
+
+    last_msg = conv.get("last_non_activity_message") or {}
+    if not last_msg:
+        msgs = conv.get("messages") or []
+        last_msg = msgs[0] if msgs else {}
+
+    last_text = (
+        last_msg.get("processed_message_content")
+        or last_msg.get("content")
+        or ""
+    )
+    unread = int(conv.get("unread_count") or 0)
+    # No unread messages for the agent → treat as "read" for list UI
+    is_read = unread == 0
+
+    last_at = _format_chat_list_timestamp(last_msg.get("updated_at"))
+    if not last_at:
+        last_at = _format_chat_list_timestamp(last_msg.get("created_at"))
+    if not last_at:
+        last_at = _format_chat_list_timestamp(conv.get("last_activity_at"))
+
+    thumb = (sender.get("thumbnail") or "").strip()
+    avatar_url = thumb if thumb else None
+
+    row = {
+        "conversation_id": conv.get("id"),
+        "inbox_id": conv.get("inbox_id"),
+        "name": name,
+        "phone_number": phone,
+        "last_message": last_text,
+        "last_message_at": last_at,
+        "unread_count": unread,
+        "is_read": is_read,
+        "muted": bool(conv.get("muted")),
+    }
+    if avatar_url:
+        row["avatar_url"] = avatar_url
+
+    lead_name = _find_lead_name_by_phone(phone)
+    if lead_name:
+        row["reference_doctype"] = LEAD_DOCTYPE
+        row["reference_name"] = lead_name
+
+    return row
+
+
+def _find_lead_name_by_phone(phone: str) -> str | None:
+    """Best-effort CRM Lead name for opening the lead from the chat list."""
+    if not phone:
+        return None
+    digits = re.sub(r"\D", "", str(phone))
+    if len(digits) < 10:
+        return None
+    # Match common stored formats: with/without +91
+    variants = {phone, digits, f"+{digits}", f"+91{digits[-10:]}", digits[-10:]}
+    for v in variants:
+        if not v:
+            continue
+        name = frappe.db.get_value(LEAD_DOCTYPE, {"mobile_no": v}, "name")
+        if name:
+            return name
+    return None
+
+
+def _normalize_phone_numbers_arg(phoneNumbers) -> list[str]:
+    """Coerce whitelist arg to a list of non-empty phone strings (JSON list string supported)."""
+    if phoneNumbers is None:
+        return []
+    raw = phoneNumbers
+    if isinstance(phoneNumbers, str):
+        s = phoneNumbers.strip()
+        if not s:
+            return []
+        try:
+            parsed = frappe.parse_json(s)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, list):
+            raw = parsed
+        else:
+            return [s]
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out: list[str] = []
+    for p in raw:
+        if p is None:
+            continue
+        t = str(p).strip()
+        if t:
+            out.append(t)
+    return out
+
+
+def _parse_conversation_list_body(body: dict) -> list[dict]:
+    inner = body.get("data")
+    if isinstance(inner, dict):
+        return inner.get("payload") or []
+    if isinstance(inner, list):
+        return inner
+    return []
+
+
+def _fetch_conversations_by_phone_filter(ctx: dict, phones: list[str]) -> list[dict]:
+    """
+    POST /accounts/:id/conversations/filter — filter by contact phone_number (OR across values).
+    https://developers.chatwoot.com/api-reference/conversations/conversations-filter
+    Phone strings must match how Chatwoot stores them or no rows will match.
+    """
+    if not phones:
+        return []
+
+    payload_filters: list[dict] = []
+    payload_filters.append({
+        "attribute_key": "phoneNumber",
+        "filter_operator": "contains",
+        "values": phones,
+    })
+
+    print(payload_filters)
+    base = f"{ctx['base_url']}/api/v1/accounts/{ctx['account_id']}/conversations/filter"
+    merged: list[dict] = []
+    seen_ids: set = set()
+    max_pages = 50
+    print(ctx["headers"])
+    for page in range(1, max_pages + 1):
+        url = f"{base}?{urlencode({'page': page})}"
+        print("URL: " + url)
+        resp = requests.post(
+            url,
+            headers=ctx["headers"],
+            json={"payload": payload_filters},
+        )
+        print("RESPONSE: " + str(resp.json()))
+        resp.raise_for_status()
+        # batch = _parse_conversation_list_body(resp.json())
+        batch = resp.json().get("payload") or []
+        print("BATCH: " + str(batch))
+        if not batch:
+            break
+        for c in batch:
+            cid = c.get("id")
+            if cid is not None and cid not in seen_ids:
+                seen_ids.add(cid)
+                merged.append(c)
+
+    return merged
+
+
+@frappe.whitelist()
+def get_chat_list(searchKey=None, phoneNumbers=None):
+    search_val = None
+    if searchKey is not None:
+        s = str(searchKey).strip()
+        if s:
+            search_val = s
+
+    phones = _normalize_phone_numbers_arg(phoneNumbers)
+    used_phone_filter = bool(phones)
+
+    ctx = _get_chatwoot_ctx()
+    if ctx is None:
+        frappe.throw("Chatwoot is not configured for this user. Check Carrum chatwoot credentials.")
+
+    raw_list = get_conversations(ctx, search=search_val, phone_numbers=phones)
+    print("RAW LIST: " + str(raw_list))
+    inbox_id = ctx.get("inbox_id")
+    if inbox_id is not None and inbox_id != "":
+        try:
+            want_inbox = int(str(inbox_id).strip())
+            raw_list = [
+                c
+                for c in raw_list
+                if str(c.get("inbox_id")).strip() == str(want_inbox)
+            ]
+        except (TypeError, ValueError):
+            pass
+
+    rows = []
+    for c in raw_list:
+        if not c.get("id"):
+            continue
+        rows.append(_conversation_to_chat_list_row(c))
+
+    if search_val and used_phone_filter:
+        sk = search_val.lower()
+        rows = [
+            r
+            for r in rows
+            if sk in (r.get("name") or "").lower()
+            or sk in (r.get("phone_number") or "").lower()
+            or sk in (r.get("last_message") or "").lower()
+        ]
+
+    rows.sort(key=lambda r: r.get("last_message_at") or "", reverse=True)
+
+    return {"count": len(rows), "data": rows}
 
 # UTILITY FUNCTIONS
-
-
 def _sanitize_phone(phoneNo: str):
     if len(phoneNo) == 10:
         return phoneNo
@@ -226,8 +459,62 @@ def _sanitize_phone(phoneNo: str):
         raise Exception("Invalid Phone number Length")
     return phoneNo.replace("+91", "")
 
+def _contact_whatsapp_source_id(contact: dict) -> str | None:
+    """Phone / identifier Chatwoot uses as WhatsApp source_id (E.164 or channel-specific)."""
+    for key in ("phone_number", "identifier"):
+        val = contact.get(key)
+        if val is not None and str(val).strip():
+            return str(val).strip().replace("+", "")
+    return None
 
-def _parse_contact_info(contact: dict) -> dict:
+
+def assign_whatsapp_inbox_to_contact(contact_id: int, ctx: dict, source_id: str) -> dict:
+    """
+    POST /accounts/:account_id/contacts/:id/contact_inboxes — link the site WhatsApp inbox
+    to an existing contact. source_id is the customer's WhatsApp identifier (contact number).
+    Returns a contact_inbox-shaped dict (nested inbox + source_id) for _parse_contact_info.
+    """
+    inbox_id = ctx.get("inbox_id")
+    if inbox_id is None or inbox_id == "":
+        frappe.throw("WhatsApp inbox_id is missing in Chatwoot context.")
+    try:
+        inbox_id_int = int(inbox_id)
+    except (TypeError, ValueError):
+        frappe.throw("Invalid inbox_id in Chatwoot context.")
+
+    source = str(source_id).strip()
+    if not source:
+        frappe.throw("source_id (contact number) is required to assign WhatsApp inbox.")
+
+    url = (
+        f"{ctx['base_url']}/api/v1/accounts/{ctx['account_id']}/contacts/"
+        f"{contact_id}/contact_inboxes"
+    )
+    print("assign inbox to contact url: " + url)
+    payload = {"inbox_id": inbox_id_int, "source_id": source}
+    print("payload: " + str(payload))
+    resp = requests.post(
+        url,
+        headers=ctx["headers"],
+        json=payload
+    )
+    resp.raise_for_status()
+    raw = resp.json()
+    ci = raw.get("payload", raw)
+    if isinstance(ci, list):
+        ci = ci[0] if ci else {}
+    if not isinstance(ci, dict):
+        frappe.throw("Unexpected Chatwoot response when assigning contact inbox.")
+
+    if not ci.get("inbox"):
+        iid = ci.get("inbox_id", inbox_id_int)
+        ci = {**ci, "inbox": {"id": iid}}
+    if not ci.get("source_id"):
+        ci = {**ci, "source_id": source}
+    return ci
+
+
+def _parse_contact_info(contact: dict, ctx: dict) -> dict:
     """Extract contact_id, inbox_id, source_id from a contact payload (with contact_inboxes)."""
     contact_id = contact["id"]
     contact_inboxes = contact.get("contact_inboxes") or []
@@ -240,7 +527,12 @@ def _parse_contact_info(contact: dict) -> dict:
         contact_inboxes[0] if contact_inboxes else None,
     )
     if not whatsapp_inbox:
-        raise Exception("Contact has no WhatsApp inbox")
+        sid = _contact_whatsapp_source_id(contact)
+        if not sid:
+            raise Exception(
+                "Contact has no phone_number/identifier; cannot assign WhatsApp inbox"
+            )
+        whatsapp_inbox = assign_whatsapp_inbox_to_contact(contact_id, ctx, sid)
     return {
         "contact_id": contact_id,
         "inbox_id": whatsapp_inbox["inbox"]["id"],
@@ -263,12 +555,12 @@ def find_contact(phone_no: str, ctx: dict) -> dict:
     resp.raise_for_status()
     data = resp.json()
     payload = data.get("payload") or []
-
+    print("CONTACT SEARCH PAYLOAD: " + str(payload), file=sys.stderr, flush=True)
     if len(payload) == 0:
         raise Exception(f"Contact not found for phone {phone_no}")
-    if len(payload) > 1:
-        raise Exception("Multiple contacts found for this phone number")
-    return _parse_contact_info(payload[0])
+    # if len(payload) > 1:
+    #     raise Exception("Multiple contacts found for this phone number")
+    return _parse_contact_info(payload[0], ctx)
 
 
 def get_or_create_contact(phone_no: str, ctx: dict) -> dict:
@@ -300,7 +592,7 @@ def get_or_create_contact(phone_no: str, ctx: dict) -> dict:
     contact_inboxes = contact_obj.get("contact_inboxes") or []
     if not contact_inboxes:
         raise Exception("Created contact has no contact_inboxes")
-    return _parse_contact_info(contact_obj)
+    return _parse_contact_info(contact_obj, ctx)
 
 
 def get_conversation(contact_id: int, ctx: dict) -> list | None:
@@ -324,10 +616,14 @@ def create_conversation(
     source_id: str,
     ctx: dict,
     initial_message: str | None = None,
+    phone_number: str | None = None,
 ) -> int:
     """Create a new conversation for the contact in the given inbox. Returns conversation_id."""
     create_url = f"{ctx['base_url']}/api/v1/accounts/{ctx['account_id']}/conversations"
     body = {"source_id": source_id, "inbox_id": inbox_id, "contact_id": contact_id}
+    pn = (phone_number or "").strip() or (source_id or "").strip()
+    if pn:
+        body["custom_attributes"] = {"phoneNumber": pn}
     if initial_message:
         body["message"] = {"content": initial_message}
     conv_resp = requests.post(create_url, headers=ctx["headers"], json=body)
@@ -354,16 +650,25 @@ def get_or_create_conversation(
     source_id: str,
     ctx: dict,
     initial_message: str | None = None,
+    phone_number: str | None = None,
 ) -> int:
     """
     Get existing open/pending conversation for this contact+inbox, or create one.
+    On create, sets conversation custom_attributes.phoneNumber when phone_number (or source_id) is set.
     Returns conversation_id.
     """
     conversations = get_conversation(contact_id, ctx)
     by_inbox = [c for c in conversations if c.get("inbox_id") == inbox_id]
     if by_inbox:
         return by_inbox[0]["id"]
-    return create_conversation(contact_id, inbox_id, source_id, ctx, initial_message)
+    return create_conversation(
+        contact_id,
+        inbox_id,
+        source_id,
+        ctx,
+        initial_message,
+        phone_number=phone_number,
+    )
 
 
 def send_message(conversation_id: int, content: str, ctx: dict) -> dict:
@@ -481,3 +786,32 @@ def get_template_info(template_name: str, ctx: dict, inbox_id: int | None = None
                 "category": category,
             }
     raise Exception(f"Template not found: {template_name}")
+
+def get_conversations(
+    ctx: dict,
+    search: str | None = None,
+    phone_numbers: list[str] | None = None,
+) -> list[dict]:
+    """
+    List conversations: either POST filter by phone_number (when phone_numbers non-empty)
+    or GET /conversations with optional q= and inbox_id=.
+    """
+    phones = phone_numbers if phone_numbers is not None else []
+    print("PHONES")
+    print(phones)
+    print("PHONES")
+    if phones:
+        return _fetch_conversations_by_phone_filter(ctx, phones)
+
+    base_url = f"{ctx['base_url']}/api/v1/accounts/{ctx['account_id']}/conversations"
+    query_parts: list[tuple[str, str]] = []
+    if search:
+        query_parts.append(("q", search))
+    inbox_id = ctx.get("inbox_id")
+    if inbox_id is not None and inbox_id != "":
+        query_parts.append(("inbox_id", str(inbox_id).strip()))
+
+    url = f"{base_url}?{urlencode(query_parts)}" if query_parts else base_url
+    resp = requests.get(url, headers=ctx["headers"])
+    resp.raise_for_status()
+    return _parse_conversation_list_body(resp.json())
