@@ -59,25 +59,20 @@ def is_whatsapp_installed():
 def get_whatsapp_messages(reference_doctype: str, reference_name: str):
     """Get the list of messages under by a lead"""
     ctx = _get_chatwoot_ctx()
-    print("CTX: "+str(ctx), file=sys.stderr, flush=True)
     if ctx is None:
         return []
-    print("REFERENCE NAME: "+LEAD_DOCTYPE, file=sys.stderr, flush=True)
     leadData = frappe.get_doc(LEAD_DOCTYPE, reference_name)
-    print("LEAD DATA: "+str(leadData), file=sys.stderr, flush=True)
+    
     leadPhoneNumber = leadData.get("mobile_no")
-    print("LEAD PHONE NUMBER: "+str(leadPhoneNumber), file=sys.stderr, flush=True)
     if not leadPhoneNumber:
         return []
+
     contactInfo = get_or_create_contact(leadPhoneNumber, ctx)
-    print("CONTACT INFO: "+str(contactInfo), file=sys.stderr, flush=True)
     conversations = get_conversation(contactInfo["contact_id"], ctx)
-    print('CONVERSATIONS: '+str(conversations), file=sys.stderr, flush=True)
     if not conversations or len(conversations) == 0:
         return []
 
     conversations = [c for c in conversations if c.get("inbox_id") == ctx["inbox_id"]]
-    print("conversations", str(conversations))
     if not conversations:
         return []
     conversations = [conversations[0]]

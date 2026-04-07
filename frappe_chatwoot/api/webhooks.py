@@ -1,8 +1,10 @@
 import frappe
-
+log = frappe.logger("frappe_chatwoot:webhooks")
 
 def _get_phone_from_payload(payload):
 	"""Extract phone number from Chatwoot webhook payload."""
+
+	log.info("Payload: "+str(payload))
 	conversation = payload.get("conversation") or {}
 	# contact_inbox.source_id e.g. "917004617522"
 	source_id = (conversation.get("contact_inbox") or {}).get("source_id")
