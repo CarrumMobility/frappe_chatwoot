@@ -1,5 +1,11 @@
+import logging
+
 import frappe
+
+# Frappe's default logger level is WARNING (dev) or ERROR (prod), so INFO never reaches the file.
+# See frappe.utils.logger.default_log_level / get_logger().
 log = frappe.logger("frappe_chatwoot:webhooks")
+log.setLevel(logging.INFO)
 
 def _get_phone_from_payload(payload):
 	"""Extract phone number from Chatwoot webhook payload."""
@@ -60,14 +66,14 @@ def conversation_updated():
 @frappe.whitelist(allow_guest=True)
 def message_created():
 	'''Register this webhook on chatwoot to handle message_created event. Emits whatsapp_message socket event for CRM.'''
-	frappe.logger().info("Chatwoot webhook hit: message_created")
+	log.info("Chatwoot webhook hit: message_created")
 	_resolve_reference_and_emit_whatsapp_message()
 	return "message_created"
 
 @frappe.whitelist(allow_guest=True)
 def message_updated():
 	'''Register this webhook on chatwoot to handle message_updated event. Emits whatsapp_message socket event for CRM.'''
-	frappe.logger().info("Chatwoot webhook hit: message_updated")
+	log.info("Chatwoot webhook hit: message_updated")
 	_resolve_reference_and_emit_whatsapp_message()
 	return {
         "message": "message_updated"
