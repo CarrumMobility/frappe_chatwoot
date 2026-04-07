@@ -30,12 +30,13 @@ def _get_chatwoot_ctx(username: str | None = None) -> dict | None:
 
     # Prefer site override; otherwise use inbox from Carrum user credentials.
     inbox_id = cfg.inboxId
-
+    agentId = cfg.agentId
     return {
         "api_access_token": token,
         "inbox_id": inbox_id,
         "account_id": account_id,
         "base_url": base_url,
+        "agent_id": agentId,
         "headers": {"api_access_token": token, "Content-Type": "application/json"},
     }
 
@@ -403,7 +404,7 @@ def _fetch_conversations_by_phone_filter(ctx: dict, phones: list[str]) -> list[d
 
 
 @frappe.whitelist()
-def get_chat_list(searchKey=None, phoneNumbers=None):
+def get_chat_list_by_phoneNumbers(searchKey=None, phoneNumbers=None):
     search_val = None
     if searchKey is not None:
         s = str(searchKey).strip()
@@ -594,6 +595,13 @@ def get_or_create_contact(phone_no: str, ctx: dict) -> dict:
         raise Exception("Created contact has no contact_inboxes")
     return _parse_contact_info(contact_obj, ctx)
 
+def get_contact(phone_no: str, ctx: dict) -> dict:
+    url = f"{ctx['base_url']}/api/v1/accounts/{ctx['account_id']}/contacts/search?page=1&q={phone_no}"
+    resp = requests.get(url, headers=ctx["headers"])
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("payload", data)
+
 
 def get_conversation(contact_id: int, ctx: dict) -> list | None:
     """
@@ -642,6 +650,28 @@ def find_conversation(contact_id: int, inbox_id: int, ctx: dict) -> dict:
     if not by_inbox:
         raise Exception("No conversation found for this contact in the given inbox")
     return by_inbox[0]
+
+
+def _conversation_assignee_user_id(conversation: dict | None) -> int | None:
+    """Best-effort Chatwoot agent (user) id from a conversation payload; shapes differ by endpoint."""
+    if not conversation:
+        return None
+    raw = conversation.get("assignee_id")
+    if raw is None:
+        meta = conversation.get("meta") or {}
+        assignee = meta.get("assignee")
+        if isinstance(assignee, dict):
+            raw = assignee.get("id")
+        else:
+            assignee = conversation.get("assignee")
+            if isinstance(assignee, dict):
+                raw = assignee.get("id")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 def get_or_create_conversation(
@@ -815,3 +845,165 @@ def get_conversations(
     resp = requests.get(url, headers=ctx["headers"])
     resp.raise_for_status()
     return _parse_conversation_list_body(resp.json())
+
+def assignSelfToContactOnChatwootIfHaveAccount(phone_no):
+    ctx = _get_chatwoot_ctx()
+    if ctx is None:
+        return {"success": False, "message": "Chatwoot is not configured for this user. Check Carrum chatwoot credentials."}
+    
+    agentId = ctx.get("agent_id")
+
+    if agentId is None:
+        return {"success": False, "message": "Agent ID is not configured for this user. Check Carrum chatwoot credentials."}
+        
+    contacts_info = get_contact(phone_no, ctx)
+
+    if not contacts_info:
+        return {'success': False, 'message': 'Contact not found'}
+
+    contact_id = None
+    if len(contacts_info) > 0 and contacts_info[0] is not None:
+        contact_id = contacts_info[0].get("id")
+
+    if contact_id is None:
+        return {'success': False, 'message': 'Contact not found'}
+
+    conversation = find_conversation(contact_id=contact_id, inbox_id=ctx.get('inbox_id'), ctx=ctx)
+
+    if not conversation:
+        return {'success': False, 'message': 'Conversation not found'}
+        
+    conversation_id = conversation.get("id")
+
+    try:
+        want_id = int(agentId)
+    except (TypeError, ValueError):
+        return {
+            "success": False,
+            "message": "Agent ID is not configured for this user. Check Carrum chatwoot credentials.",
+        }
+
+    already = _conversation_assignee_user_id(conversation)
+    if already is not None and already == want_id:
+        return {"success": True}
+
+    assign_agent_to_conversation(conversation_id=conversation_id, agent_id=want_id, ctx=ctx)
+    return {"success": True}
+
+
+def assign_agent_to_conversation(conversation_id: int, agent_id: int, ctx: dict):
+    # https://chatwoot-dev.carrum.co.in/api/v1/accounts/1/conversations/2/assignments
+    url = f"{ctx['base_url']}/api/v1/accounts/{ctx['account_id']}/conversations/{conversation_id}/assignments"
+    resp = requests.post(url, headers=ctx["headers"], json={"assignee_id": agent_id})
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _conversation_page_size(meta: dict, payload_len: int) -> int:
+    """Infer page size from Chatwoot list meta or payload length."""
+    for key in ("per_page", "page_limit", "limit"):
+        v = meta.get(key)
+        if v is not None:
+            try:
+                n = int(v)
+                if n > 0:
+                    return n
+            except (TypeError, ValueError):
+                pass
+    if payload_len > 0:
+        return max(payload_len, 15)
+    return 15
+
+
+@frappe.whitelist()
+def get_my_conversations(searchKey: str | int | None = None, page: int | str | None = 1):
+    """
+    List conversations assigned to the current agent (Chatwoot token user).
+
+    GET .../conversations?assignee_type=me&status=open&page=1&q=...
+
+    Returns::
+        {
+          "status": True,
+          "data": {
+            "haveMore": <bool>,
+            "page": <int>,
+            "conversations": [<raw Chatwoot conversation objects>],
+            "rows": [<CRM chat list rows for WaChatListModal>],
+          },
+        }
+    """
+    ctx = _get_chatwoot_ctx()
+    if ctx is None:
+        return {
+            "success": False,
+            "message": "Chatwoot is not configured for this user. Check Carrum chatwoot credentials.",
+        }
+
+    try:
+        page_i = int(page) if page is not None else 1
+    except (TypeError, ValueError):
+        page_i = 1
+    if page_i < 1:
+        page_i = 1
+
+    params: dict[str, str | int] = {
+        "assignee_type": "me",
+        "page": page_i,
+        "status": "open",
+    }
+
+    sk = str(searchKey).strip() if searchKey is not None else ""
+    if sk:
+        params["q"] = sk
+
+    inbox_id = ctx.get("inbox_id")
+    if inbox_id is not None and str(inbox_id).strip() != "":
+        try:
+            params["inbox_id"] = int(str(inbox_id).strip())
+        except (TypeError, ValueError):
+            params["inbox_id"] = str(inbox_id).strip()
+
+    url = f"{ctx['base_url']}/api/v1/accounts/{ctx['account_id']}/conversations"
+    try:
+        resp = requests.get(url, headers=ctx["headers"], params=params, timeout=60)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        return {"success": False, "message": str(e)}
+
+    body = resp.json()
+    payload = _parse_conversation_list_body(body)
+
+    data_block = body.get("data")
+    meta = data_block.get("meta") if isinstance(data_block, dict) else {}
+    if not isinstance(meta, dict):
+        meta = {}
+
+    per_page = _conversation_page_size(meta, len(payload))
+    have_more = len(payload) >= per_page
+
+    for key in ("total_pages", "page_count"):
+        total_pages = meta.get(key)
+        cur = meta.get("current_page")
+        if total_pages is not None and cur is not None:
+            try:
+                have_more = int(cur) < int(total_pages)
+            except (TypeError, ValueError):
+                pass
+            break
+
+    rows: list[dict] = []
+    for c in payload:
+        if not c.get("id"):
+            continue
+        rows.append(_conversation_to_chat_list_row(c))
+
+    return {
+        "status": True,
+        "data": {
+            "haveMore": have_more,
+            "page": page_i,
+            "conversations": payload,
+            "rows": rows,
+        },
+    }
