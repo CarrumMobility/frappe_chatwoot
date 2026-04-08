@@ -1,12 +1,15 @@
+import os
 import random
 import re
 import sys
+import mimetypes
 from datetime import datetime, timezone
-from urllib.parse import urlencode
+from urllib.parse import unquote, urlparse, urlencode
 
 from core.api import carrum_accounts
 import frappe
 import requests
+from frappe import _
 
 LEAD_DOCTYPE = "CRM Lead"
 FRAPPE_CHATWOOT_MESSAGE_TYPE_MAPPING = {1: "Outgoing", 2: "Incoming"}
@@ -55,84 +58,186 @@ def is_whatsapp_installed():
     return True
 
 
+def _chatwoot_api_message_to_crm_whatsapp_row(
+    msg: dict,
+    contact_info: dict,
+    reference_doctype: str,
+    reference_name: str,
+) -> dict | None:
+    """Map one Chatwoot REST message to the shape expected by CRM WhatsAppArea.vue."""
+    sender = msg.get("sender")
+    if not sender:
+        return None
+
+    msg_type = FRAPPE_CHATWOOT_MESSAGE_TYPE_MAPPING.get(msg.get("message_type"))
+    from_name = sender.get("name") if isinstance(sender, dict) else None
+    created_at = msg.get("created_at")
+    creation_str = None
+    if created_at is not None:
+        try:
+            dt = (
+                datetime.fromtimestamp(created_at)
+                if isinstance(created_at, (int, float))
+                else frappe.utils.get_datetime(created_at)
+            )
+            creation_str = (
+                frappe.utils.format_datetime(dt, "yyyy-MM-dd HH:mm:ss") if dt else None
+            )
+        except Exception:
+            creation_str = None
+
+    raw_body = msg.get("processed_message_content")
+    if raw_body is None:
+        raw_body = msg.get("content")
+    body = "" if raw_body is None else str(raw_body)
+
+    attachments = msg.get("attachments") or []
+    if not isinstance(attachments, list):
+        attachments = []
+    if not attachments and isinstance(msg.get("attachment"), dict):
+        attachments = [msg["attachment"]]
+
+    attach_url = msg.get("attachment")
+    if isinstance(attach_url, dict):
+        attach_url = (
+            attach_url.get("data_url")
+            or attach_url.get("thumb_url")
+            or attach_url.get("media_url")
+        )
+    elif isinstance(attach_url, str):
+        attach_url = attach_url.strip() or None
+    else:
+        attach_url = None
+
+    content_type = str(msg.get("content_type") or "text").lower()
+    attach_file_name = ""
+
+    if attachments:
+        a0 = attachments[0] if isinstance(attachments[0], dict) else {}
+        ft = str(a0.get("file_type") or "").lower()
+        attach_file_name = str(a0.get("file_name") or "").strip()
+        if ft in ("image", "gif", "sticker"):
+            content_type = "image"
+            attach_url = (
+                a0.get("data_url")
+                or a0.get("thumb_url")
+                or a0.get("media_url")
+                or attach_url
+            )
+        elif ft == "video":
+            content_type = "video"
+            attach_url = (
+                a0.get("data_url")
+                or a0.get("media_url")
+                or a0.get("thumb_url")
+                or attach_url
+            )
+        elif ft == "audio":
+            content_type = "audio"
+            attach_url = (
+                a0.get("data_url")
+                or a0.get("media_url")
+                or attach_url
+            )
+        else:
+            content_type = "document"
+            attach_url = (
+                a0.get("data_url")
+                or a0.get("media_url")
+                or attach_url
+            )
+
+    template_val = msg.get("template")
+    message_type_ui = "Template" if template_val else "Manual"
+
+    has_display = bool(body.strip()) or bool(attach_url) or bool(template_val)
+    if not has_display:
+        return None
+
+    return {
+        "name": str(msg.get("id")),
+        "type": msg_type,
+        "to": None,
+        "from": contact_info.get("source_id"),
+        "content_type": content_type,
+        "message_type": message_type_ui,
+        "attach": attach_url,
+        "attach_file_name": attach_file_name,
+        "template": template_val,
+        "use_template": msg.get("use_template"),
+        "message_id": msg.get("source_id") or f"msg_{random.randint(100000, 999999)}",
+        "is_reply": msg.get("is_reply") or 0,
+        "reply_to_message_id": msg.get("reply_to_message_id"),
+        "creation": creation_str,
+        "message": body,
+        "status": msg.get("status"),
+        "reference_doctype": reference_doctype,
+        "reference_name": reference_name,
+        "template_parameters": msg.get("template_parameters"),
+        "template_header_parameters": msg.get("template_header_parameters"),
+        "from_name": from_name or "Administrator",
+    }
+
+
+def _empty_whatsapp_messages_payload(can_reply: bool = False) -> dict:
+    return {"messages": [], "can_reply": bool(can_reply)}
+
+
 @frappe.whitelist()
 def get_whatsapp_messages(reference_doctype: str, reference_name: str):
-    """Get the list of messages under by a lead"""
+    """
+    Return WhatsApp thread messages for a lead plus Chatwoot ``can_reply``.
+
+    ``can_reply`` comes from the contact's conversation payload (see Chatwoot
+    contact conversations API). When false, only template messages can reopen the
+    session — mirror that in the desk composer.
+    """
     ctx = _get_chatwoot_ctx()
     if ctx is None:
-        return []
+        return _empty_whatsapp_messages_payload(False)
     leadData = frappe.get_doc(LEAD_DOCTYPE, reference_name)
     
     leadPhoneNumber = leadData.get("mobile_no")
     if not leadPhoneNumber:
-        return []
+        return _empty_whatsapp_messages_payload(False)
 
     contactInfo = get_or_create_contact(leadPhoneNumber, ctx)
     conversations = get_conversation(contactInfo["contact_id"], ctx)
     if not conversations or len(conversations) == 0:
-        return []
+        return _empty_whatsapp_messages_payload(False)
 
     conversations = [c for c in conversations if c.get("inbox_id") == ctx["inbox_id"]]
     if not conversations:
-        return []
-    conversations = [conversations[0]]
+        return _empty_whatsapp_messages_payload(False)
+
+    primary_conv = conversations[0]
+    can_reply = primary_conv.get("can_reply")
+    if can_reply is None:
+        can_reply = True
+
     all_messages = []
     lastMsgId = None
-    for conversation in conversations:
-        conversation_id = conversation.get("id")
-        if not conversation_id:
-            continue
+    conversation_id = primary_conv.get("id")
+    if conversation_id:
         while True:
             raw_messages = get_messages(conversation_id, ctx, before_msg_id=lastMsgId)
             if len(raw_messages) == 0:
                 break
             lastMsgId = raw_messages[0].get("id")
             all_messages.extend(raw_messages)
+
     data = []
     for msg in all_messages:
-        sender = msg.get("sender")
-        if not sender:
-            continue
-        msg_type = FRAPPE_CHATWOOT_MESSAGE_TYPE_MAPPING.get(msg.get("message_type"))
-        from_name = sender.get("name") if isinstance(sender, dict) else None
-        created_at = msg.get("created_at")
-        creation_str = None
-        if created_at is not None:
-            try:
-                dt = (
-                    datetime.fromtimestamp(created_at)
-                    if isinstance(created_at, (int, float))
-                    else frappe.utils.get_datetime(created_at)
-                )
-                creation_str = frappe.utils.format_datetime(dt, "yyyy-MM-dd HH:mm:ss") if dt else None
-            except Exception:
-                creation_str = None
-        if msg.get("content") is None:
-            continue
-        data.append({
-            "name": str(msg.get("id")),
-            "type": msg_type,
-            "to": None,
-            "from": contactInfo.get("source_id"),
-            "content_type": msg.get("content_type"),
-            "message_type": "Manual",
-            "attach": msg.get("attachment"),
-            "template": msg.get("template"),
-            "use_template": msg.get("use_template"),
-            "message_id": msg.get("source_id") or f"msg_{random.randint(100000, 999999)}",
-            "is_reply": msg.get("is_reply") or 0,
-            "reply_to_message_id": msg.get("reply_to_message_id"),
-            "creation": creation_str,
-            "message": msg.get("content"),
-            "status": msg.get("status"),
-            "reference_doctype": reference_doctype,
-            "reference_name": reference_name,
-            "template_parameters": msg.get("template_parameters"),
-            "template_header_parameters": msg.get("template_header_parameters"),
-            "from_name": from_name or "Administrator",
-        })
+        row = _chatwoot_api_message_to_crm_whatsapp_row(
+            msg, contactInfo, reference_doctype, reference_name
+        )
+        if row:
+            data.append(row)
 
-    return data
+    data.sort(
+        key=lambda r: (r.get("creation") or "", int(r["name"]) if str(r.get("name") or "").isdigit() else 0)
+    )
+    return {"messages": data, "can_reply": bool(can_reply)}
 
 
 @frappe.whitelist()
@@ -165,7 +270,7 @@ def create_whatsapp_message(
     if conv is not None and conv.get("can_reply") is False:
         frappe.throw("Send a template message to resume the conversation")
 
-    msg_response = send_message(conversation_id, message, ctx)
+    msg_response = send_message(conversation_id, message, ctx, attach=(attach or "").strip() or None)
 
     return {
         "contact_id": contact_info["contact_id"],
@@ -182,18 +287,49 @@ def react_on_whatsapp_message(emoji: str, reply_to_name: str):
 
 
 @frappe.whitelist()
-def send_whatsapp_template(reference_doctype: str, reference_name: str, template: str, to: str):
+def send_whatsapp_template(
+    reference_doctype: str,
+    reference_name: str,
+    template: str,
+    to: str,
+    body_params=None,
+):
     """
     Validate template via inbox API, find or create contact and conversation,
-    then send a WhatsApp template message with body variables set to TEST_VAL.
+    then send a WhatsApp template message.
+
+    If ``body_params`` is omitted, body placeholders {{1}}, {{2}}, … are filled with
+    TEST_VAL (legacy behaviour). If ``body_params`` is provided (dict), each required
+    index must have a non-empty string value, e.g. ``{"1": "Ann", "2": "3pm"}``.
     """
     ctx = _get_chatwoot_ctx()
     if ctx is None:
         frappe.throw("Chatwoot is not configured for this user. Check Carrum chatwoot credentials.")
+
+    if isinstance(body_params, str) and body_params.strip():
+        body_params = frappe.parse_json(body_params)
+    elif body_params == "":
+        body_params = None
+
     template_info = get_template_info(template, ctx)
     body_variable_indices = template_info["body_variable_indices"]
-    body_params = {str(i): DUMMY_TEMPLATE_VAL for i in body_variable_indices}
-    content = _fill_template_body(template_info.get("body_text", ""), body_params)
+
+    if body_params is None:
+        body_params_dict = {str(i): DUMMY_TEMPLATE_VAL for i in body_variable_indices}
+    else:
+        if not isinstance(body_params, dict):
+            frappe.throw(_("body_params must be an object mapping variable index to text"))
+        body_params_dict = {}
+        for i in body_variable_indices:
+            key = str(i)
+            raw_val = body_params.get(key)
+            if raw_val is None and i in body_params:
+                raw_val = body_params.get(i)
+            if raw_val is None or (isinstance(raw_val, str) and not raw_val.strip()):
+                frappe.throw(_("Please provide a value for template variable {0}").format(key))
+            body_params_dict[key] = str(raw_val).strip()
+
+    content = _fill_template_body(template_info.get("body_text", ""), body_params_dict)
 
     phone_no = _sanitize_phone(to)
     contact_info = get_or_create_contact(phone_no, ctx)
@@ -209,7 +345,7 @@ def send_whatsapp_template(reference_doctype: str, reference_name: str, template
         conversation_id=conversation_id,
         template_name=template,
         content=content,
-        body_params=body_params,
+        body_params=body_params_dict,
         category=str(template_info.get("category", "UTILITY")),
         language=str(template_info.get("language", "en")),
         ctx=ctx,
@@ -221,6 +357,74 @@ def send_whatsapp_template(reference_doctype: str, reference_name: str, template
         "conversation_id": conversation_id,
         "message": msg_response,
     }
+
+def _chatwoot_message_list_meta(msg: dict | None) -> dict:
+    """
+    Build chat-list preview text and optional media thumbnail from a Chatwoot message payload.
+
+    Uses the same [image] / [video] / [document] / [audio] prefixes as WaChatListModal.vue.
+    """
+    out: dict = {"preview": "", "thumb_url": None}
+    if not msg or not isinstance(msg, dict):
+        return out
+
+    from frappe.utils import strip_html
+
+    raw_content = msg.get("processed_message_content")
+    if raw_content is None:
+        raw_content = msg.get("content")
+    content = ""
+    if raw_content is not None and str(raw_content).strip():
+        content = (
+            strip_html(str(raw_content).strip()) or str(raw_content).strip()
+        ).strip()
+
+    attachments = msg.get("attachments")
+    if not isinstance(attachments, list):
+        attachments = []
+    if not attachments and isinstance(msg.get("attachment"), dict):
+        attachments = [msg["attachment"]]
+
+    if not attachments:
+        out["preview"] = content
+        return out
+
+    att0 = attachments[0] if isinstance(attachments[0], dict) else {}
+    ft = str(att0.get("file_type") or "").lower()
+    fn = (str(att0.get("file_name") or "").strip()) or (
+        str(att0.get("extension") or "").strip()
+    )
+
+    thumb = None
+    if ft in ("image", "gif", "sticker"):
+        thumb = (
+            (att0.get("thumb_url") or att0.get("data_url") or "").strip() or None
+        )
+    elif ft == "video":
+        thumb = (str(att0.get("thumb_url") or "").strip() or None)
+
+    if ft in ("image", "gif", "sticker"):
+        tag = "[image]"
+    elif ft == "video":
+        tag = "[video]"
+    elif ft == "audio":
+        tag = "[audio]"
+    else:
+        tag = "[document]"
+
+    if tag == "[document]":
+        rest_parts = [p for p in (fn, content) if p]
+        rest = " ".join(rest_parts)
+        preview = f"{tag} {rest}".strip() if rest else tag
+    elif content:
+        preview = f"{tag} {content}"
+    else:
+        preview = tag
+
+    out["preview"] = preview
+    out["thumb_url"] = thumb
+    return out
+
 
 def _format_chat_list_timestamp(value) -> str:
     """Normalize Chatwoot ISO / unix timestamps to 'YYYY-MM-DD HH:MM:SS' (UTC)."""
@@ -256,11 +460,9 @@ def _conversation_to_chat_list_row(conv: dict) -> dict:
         msgs = conv.get("messages") or []
         last_msg = msgs[0] if msgs else {}
 
-    last_text = (
-        last_msg.get("processed_message_content")
-        or last_msg.get("content")
-        or ""
-    )
+    list_meta = _chatwoot_message_list_meta(last_msg if last_msg else None)
+    last_text = list_meta.get("preview") or ""
+    last_thumb = list_meta.get("thumb_url")
     unread = int(conv.get("unread_count") or 0)
     # No unread messages for the agent → treat as "read" for list UI
     is_read = unread == 0
@@ -287,6 +489,7 @@ def _conversation_to_chat_list_row(conv: dict) -> dict:
     }
     if avatar_url:
         row["avatar_url"] = avatar_url
+    row["last_message_thumb"] = last_thumb
 
     lead_name = _find_lead_name_by_phone(phone)
     if lead_name:
@@ -696,10 +899,105 @@ def get_or_create_conversation(
     )
 
 
-def send_message(conversation_id: int, content: str, ctx: dict) -> dict:
-    """Send a message in an existing conversation. Returns the message response."""
+MAX_WHATSAPP_ATTACHMENT_BYTES = 40 * 1024 * 1024
+
+
+def _attachment_fs_path_from_url_path(path: str) -> str | None:
+    """Map /files/... or /private/files/... URL path to an on-disk site path."""
+    path = unquote((path or "").split("?", 1)[0])
+    if "/private/files/" in path:
+        rel = path.split("/private/files/", 1)[1].lstrip("/")
+        base = frappe.get_site_path("private", "files")
+    elif "/files/" in path:
+        rel = path.split("/files/", 1)[1].lstrip("/")
+        base = frappe.get_site_path("public", "files")
+    else:
+        return None
+    rel_norm = rel.replace("\\", "/")
+    if ".." in rel_norm.split("/"):
+        frappe.throw(_("Invalid attachment path"))
+    full = os.path.normpath(os.path.join(base, *rel_norm.split("/")))
+    base_norm = os.path.normpath(base)
+    if full != base_norm and not full.startswith(base_norm + os.sep):
+        frappe.throw(_("Invalid attachment path"))
+    return full
+
+
+def _read_bytes_from_filesystem(fs_path: str) -> tuple[bytes, str, str]:
+    fname = os.path.basename(fs_path)
+    with open(fs_path, "rb") as f:
+        data = f.read()
+    mime, _ = mimetypes.guess_type(fname)
+    mime = mime or "application/octet-stream"
+    return data, fname, mime
+
+
+def _resolve_attachment_file(attach: str) -> tuple[bytes, str, str]:
+    """
+    Load attachment bytes for Chatwoot multipart upload.
+    Prefers local site files for /files and /private/files URLs; otherwise HTTP GET.
+    """
+    raw = (attach or "").strip()
+    if not raw:
+        frappe.throw(_("No attachment URL provided"))
+    if not raw.startswith(("http://", "https://", "/")) and raw.startswith(
+        ("private/files/", "files/")
+    ):
+        raw = "/" + raw
+
+    parsed = urlparse(raw)
+    if parsed.scheme in ("http", "https"):
+        site_url = frappe.utils.get_url()
+        site_netloc = urlparse(site_url).netloc
+        path_part = unquote((parsed.path or "").split("?", 1)[0])
+        if parsed.netloc == site_netloc and path_part:
+            fs_path = _attachment_fs_path_from_url_path(path_part)
+            if fs_path and os.path.isfile(fs_path):
+                return _read_bytes_from_filesystem(fs_path)
+        resp = requests.get(raw, timeout=90)
+        resp.raise_for_status()
+        fname = os.path.basename(path_part) or "attachment"
+        mime = (resp.headers.get("content-type") or "application/octet-stream").split(";")[0].strip()
+        data = resp.content
+    else:
+        fs_path = _attachment_fs_path_from_url_path(raw)
+        if not fs_path or not os.path.isfile(fs_path):
+            frappe.throw(_("Attachment file not found"))
+        data, fname, mime = _read_bytes_from_filesystem(fs_path)
+
+    if len(data) > MAX_WHATSAPP_ATTACHMENT_BYTES:
+        frappe.throw(_("Attachment is too large to send via WhatsApp"))
+    return data, fname, mime
+
+
+def send_message(
+    conversation_id: int,
+    content: str,
+    ctx: dict,
+    attach: str | None = None,
+) -> dict:
+    """Send a text message and/or attachment in an existing conversation. Returns the message response."""
     url = f"{ctx['base_url']}/api/v1/accounts/{ctx['account_id']}/conversations/{conversation_id}/messages"
-    resp = requests.post(url, headers=ctx["headers"], json={"content": content})
+    text = (content or "").strip()
+
+    if attach:
+        file_bytes, filename, mime = _resolve_attachment_file(attach)
+        headers = {
+            k: v
+            for k, v in ctx["headers"].items()
+            if k.lower() != "content-type"
+        }
+        data = {
+            "content": text if text else " ",
+            "message_type": "outgoing",
+            "private": "false",
+        }
+        files = {"attachments[]": (filename, file_bytes, mime)}
+        resp = requests.post(url, headers=headers, data=data, files=files, timeout=120)
+        resp.raise_for_status()
+        return resp.json()
+
+    resp = requests.post(url, headers=ctx["headers"], json={"content": text})
     resp.raise_for_status()
     return resp.json()
 
