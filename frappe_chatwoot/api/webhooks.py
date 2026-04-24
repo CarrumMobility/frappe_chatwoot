@@ -51,9 +51,9 @@ def _extract_message_and_conversation(payload: dict):
 
 
 def _chat_list_recipient(reference_doctype: str, reference_name: str) -> str | None:
-	"""User who receives WaChatList updates: lead_owner (CRM Lead) or deal_owner (CRM Deal)."""
+	"""User who receives WaChatList updates: telecaller (CRM Lead) or deal_owner (CRM Deal)."""
 	if reference_doctype == "CRM Lead":
-		u = frappe.db.get_value("CRM Lead", reference_name, "lead_owner")
+		u = frappe.db.get_value("CRM Lead", reference_name, "telecaller")
 	else:
 		return None
 	if u and u != "Guest":
@@ -120,7 +120,7 @@ def _resolve_reference_and_emit_whatsapp_message():
 	"""
 	Emit two realtime events:
 	
-	- whatsapp_message_list → single user (lead_owner / deal_owner) with chat_list payload for WaChatList.
+	- whatsapp_message_list → single user (telecaller / deal_owner) with chat_list payload for WaChatList.
 	- whatsapp_message → CRM Lead / CRM Deal document room (subscribers viewing that doc in desk/SPA).
 	"""
 
@@ -133,10 +133,10 @@ def _resolve_reference_and_emit_whatsapp_message():
 	if not reference_name or not reference_doctype:
 		return
 	
-	lead_owner = None
+	telecaller_user = None
 	deal_owner = None
 	if reference_doctype == "CRM Lead":
-		lead_owner = frappe.db.get_value("CRM Lead", reference_name, "lead_owner")
+		telecaller_user = frappe.db.get_value("CRM Lead", reference_name, "telecaller")
 	elif reference_doctype == "CRM Deal":
 		deal_owner = frappe.db.get_value("CRM Deal", reference_name, "deal_owner")
 
@@ -151,8 +151,8 @@ def _resolve_reference_and_emit_whatsapp_message():
 		"reference_doctype": reference_doctype,
 		"reference_name": reference_name,
 	}
-	if lead_owner is not None:
-		message_detail["lead_owner"] = lead_owner
+	if telecaller_user is not None:
+		message_detail["telecaller"] = telecaller_user
 	if deal_owner is not None:
 		message_detail["deal_owner"] = deal_owner
 

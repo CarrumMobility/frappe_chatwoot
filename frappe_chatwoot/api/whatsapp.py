@@ -12,6 +12,7 @@ import requests
 from frappe import _
 
 LEAD_DOCTYPE = "CRM Lead"
+DEAL_DOCTYPE = "CRM Deal"
 FRAPPE_CHATWOOT_MESSAGE_TYPE_MAPPING = {1: "Outgoing", 2: "Incoming"}
 
 
@@ -180,7 +181,40 @@ def _chatwoot_api_message_to_crm_whatsapp_row(
 
 
 def _empty_whatsapp_messages_payload(can_reply: bool = False) -> dict:
-    return {"messages": [], "can_reply": bool(can_reply)}
+    return {
+        "messages": [],
+        "can_reply": bool(can_reply),
+        "conversation_id": None,
+    }
+
+
+def _get_crm_ref_doc_for_whatsapp_thread(reference_doctype: str, reference_name: str):
+    if reference_doctype == DEAL_DOCTYPE:
+        return frappe.get_doc(DEAL_DOCTYPE, reference_name)
+    return frappe.get_doc(LEAD_DOCTYPE, reference_name)
+
+
+def _conversation_unread_count(conv: dict) -> int:
+    """Chatwoot may expose unread as ``unread_count`` or (rarely) ``unread`` on the root or in ``meta``."""
+    if not conv or not isinstance(conv, dict):
+        return 0
+    for key in ("unread_count", "unread"):
+        v = conv.get(key)
+        if v is not None:
+            try:
+                return max(0, int(v))
+            except (TypeError, ValueError):
+                pass
+    meta = conv.get("meta")
+    if isinstance(meta, dict):
+        for key in ("unread_count", "unread"):
+            v = meta.get(key)
+            if v is not None:
+                try:
+                    return max(0, int(v))
+                except (TypeError, ValueError):
+                    pass
+    return 0
 
 
 @frappe.whitelist()
@@ -195,13 +229,17 @@ def get_whatsapp_messages(reference_doctype: str, reference_name: str):
     ctx = _get_chatwoot_ctx()
     if ctx is None:
         return _empty_whatsapp_messages_payload(False)
-    leadData = frappe.get_doc(LEAD_DOCTYPE, reference_name)
-    
-    leadPhoneNumber = leadData.get("mobile_no")
-    if not leadPhoneNumber:
+    try:
+        ref_doc = _get_crm_ref_doc_for_whatsapp_thread(
+            str(reference_doctype or ""), str(reference_name or "")
+        )
+    except Exception:
+        return _empty_whatsapp_messages_payload(False)
+    lead_phone_number = (ref_doc.get("mobile_no") or "").strip() if ref_doc else ""
+    if not lead_phone_number:
         return _empty_whatsapp_messages_payload(False)
 
-    contactInfo = get_or_create_contact(leadPhoneNumber, ctx)
+    contactInfo = get_or_create_contact(lead_phone_number, ctx)
     conversations = get_conversation(contactInfo["contact_id"], ctx)
     if not conversations or len(conversations) == 0:
         return _empty_whatsapp_messages_payload(False)
@@ -237,7 +275,11 @@ def get_whatsapp_messages(reference_doctype: str, reference_name: str):
     data.sort(
         key=lambda r: (r.get("creation") or "", int(r["name"]) if str(r.get("name") or "").isdigit() else 0)
     )
-    return {"messages": data, "can_reply": bool(can_reply)}
+    return {
+        "messages": data,
+        "can_reply": bool(can_reply),
+        "conversation_id": conversation_id,
+    }
 
 
 @frappe.whitelist()
@@ -312,15 +354,18 @@ def send_whatsapp_template(
         body_params = None
 
     template_info = get_template_info(template, ctx)
-    body_variable_indices = template_info["body_variable_indices"]
+    all_var_indices = template_info.get("all_variable_indices") or template_info.get(
+        "body_variable_indices", []
+    )
+    t_raw = template_info.get("raw_template") or {}
 
     if body_params is None:
-        body_params_dict = {str(i): DUMMY_TEMPLATE_VAL for i in body_variable_indices}
+        body_params_dict = {str(i): DUMMY_TEMPLATE_VAL for i in all_var_indices}
     else:
         if not isinstance(body_params, dict):
             frappe.throw(_("body_params must be an object mapping variable index to text"))
         body_params_dict = {}
-        for i in body_variable_indices:
+        for i in all_var_indices:
             key = str(i)
             raw_val = body_params.get(key)
             if raw_val is None and i in body_params:
@@ -330,6 +375,11 @@ def send_whatsapp_template(
             body_params_dict[key] = str(raw_val).strip()
 
     content = _fill_template_body(template_info.get("body_text", ""), body_params_dict)
+    processed = _build_processed_params_for_chatwoot(t_raw, body_params_dict)
+    if not processed and body_params_dict:
+        processed = {"body": body_params_dict}
+    if processed == {} and not all_var_indices:
+        processed = None  # use legacy { body: body_params } in send_template_message
 
     phone_no = _sanitize_phone(to)
     contact_info = get_or_create_contact(phone_no, ctx)
@@ -349,6 +399,7 @@ def send_whatsapp_template(
         category=str(template_info.get("category", "UTILITY")),
         language=str(template_info.get("language", "en")),
         ctx=ctx,
+        processed_params_override=processed,
     )
     return {
         "contact_id": contact_info["contact_id"],
@@ -463,7 +514,7 @@ def _conversation_to_chat_list_row(conv: dict) -> dict:
     list_meta = _chatwoot_message_list_meta(last_msg if last_msg else None)
     last_text = list_meta.get("preview") or ""
     last_thumb = list_meta.get("thumb_url")
-    unread = int(conv.get("unread_count") or 0)
+    unread = _conversation_unread_count(conv)
     # No unread messages for the agent → treat as "read" for list UI
     is_read = unread == 0
 
@@ -495,6 +546,7 @@ def _conversation_to_chat_list_row(conv: dict) -> dict:
     if lead_name:
         row["reference_doctype"] = LEAD_DOCTYPE
         row["reference_name"] = lead_name
+        row["reference_docname"] = lead_name
 
     return row
 
@@ -762,16 +814,23 @@ def find_contact(phone_no: str, ctx: dict) -> dict:
     return _parse_contact_info(payload[0], ctx)
 
 
-def get_or_create_contact(phone_no: str, ctx: dict) -> dict:
+def get_or_create_contact(
+    phone_no: str, ctx: dict, contact_name: str | None = None
+) -> dict:
     """
     Search contact by phone; create if not found. Returns contact_id, inbox_id, source_id
     for the WhatsApp channel.
+
+    ``contact_name`` is used as the Chatwoot contact's display name when a new contact is
+    created. Existing contacts are not renamed. Falls back to ``phone_no`` when not
+    provided so we never POST an empty name.
     """
     try:
         return find_contact(phone_no, ctx)
     except Exception as e:
         if "Contact not found" not in str(e):
             raise
+    display_name = (str(contact_name).strip() if contact_name is not None else "") or phone_no
     create_url = f"{ctx['base_url']}/api/v1/accounts/{ctx['account_id']}/contacts"
     create_resp = requests.post(
         create_url,
@@ -779,7 +838,7 @@ def get_or_create_contact(phone_no: str, ctx: dict) -> dict:
         json={
             "inbox_id": ctx["inbox_id"],
             "phone_number": f"+91{phone_no}",
-            "name": phone_no,
+            "name": display_name,
             "identifier": phone_no,
         },
     )
@@ -1010,22 +1069,25 @@ def send_template_message(
     body_params: dict | None = None,
     category: str = "UTILITY",
     language: str = "en",
+    processed_params_override: dict | None = None,
 ) -> dict:
     """
     Send a WhatsApp template message in an existing conversation.
-    body_params: map of variable index to value, e.g. {"1": "val1", "2": "val2"}.
-    Returns the message response.
+    body_params: map of variable index to value (legacy, body only).
+    If ``processed_params_override`` is set (header, body, footer, buttons for Chatwoot
+    `processed_params`), that structure is used instead of body-only.
     """
-    body_params = body_params or {}
+    if processed_params_override is not None:
+        proc = processed_params_override
+    else:
+        proc = {"body": body_params or {}}
     payload = {
         "content": content,
         "template_params": {
             "name": template_name,
             "category": category,
             "language": language,
-            "processed_params": {
-                "body": body_params,
-            },
+            "processed_params": proc,
         },
     }
     url = f"{ctx['base_url']}/api/v1/accounts/{ctx['account_id']}/conversations/{conversation_id}/messages"
@@ -1058,11 +1120,214 @@ DUMMY_TEMPLATE_VAL = "TEST_VAL"
 
 
 def _parse_body_variable_indices(body_text: str) -> list[int]:
-    """Extract WhatsApp body variable indices from BODY text (e.g. {{1}}, {{2}}). Returns sorted unique indices."""
+    """Extract WhatsApp variable indices from any component text/URL (e.g. {{1}}, {{2}}). Sorted unique."""
     if not body_text:
         return []
-    matches = re.findall(r"\{\{(\d+)\}\}", body_text)
+    matches = re.findall(r"\{\{(\d+)\}\}", str(body_text))
     return sorted(set(int(m) for m in matches))
+
+
+def _iter_template_component_strings(t: dict) -> list[tuple[str, str, str | None]]:
+    """
+    (component_key, free_text, note_for_hints)
+    component_key: "header" | "body" | "footer" | "button_url" | "button"
+    For buttons: note is button label, text is the URL to scan for {{n}}
+    """
+    out: list[tuple[str, str, str | None]] = []
+    for comp in t.get("components") or []:
+        cty = (comp.get("type") or "").upper()
+        cfmt = (comp.get("format") or "TEXT").upper()
+        if cty == "HEADER" and cfmt in ("", "TEXT") and (comp.get("text") is not None):
+            out.append(("header", str(comp.get("text") or ""), None))
+        elif cty == "HEADER":
+            continue
+        elif cty == "BODY":
+            out.append(("body", str(comp.get("text") or ""), None))
+        elif cty == "FOOTER":
+            out.append(("footer", str(comp.get("text") or ""), None))
+        elif cty == "BUTTONS":
+            for btn in comp.get("buttons") or []:
+                btxt = str((btn or {}).get("text") or "Button")
+                btype = str((btn or {}).get("type") or "").upper()
+                url = (btn or {}).get("url") or ""
+                if btype == "URL" and url:
+                    out.append(
+                        (
+                            "button_url",
+                            str(url),
+                            f"Button “{btxt}” (link)" if btxt else "Button link",
+                        )
+                    )
+    return out
+
+
+def enrich_message_template(t: dict) -> dict:
+    """
+    One Chatwoot / Meta template → row for CRM “WhatsApp Templates” list and UI.
+    Includes all positional {{n}} in header, body, footer, and button URLs.
+    """
+    from collections import defaultdict
+
+    if not t or not isinstance(t, dict):
+        return {
+            "name": "",
+            "template": "",
+            "footer": "",
+            "header": "",
+            "all_variable_indices": [],
+            "variable_hints": {},
+            "button_preview": [],
+        }
+
+    header_text, body_text, footer_text = "", "", ""
+    for comp in t.get("components") or []:
+        cty = (comp.get("type") or "").upper()
+        cfmt = (comp.get("format") or "TEXT").upper()
+        if cty == "HEADER" and cfmt in ("", "TEXT") and (comp.get("text") is not None):
+            header_text = str(comp.get("text") or "")
+        elif cty == "BODY":
+            body_text = str(comp.get("text") or "")
+        elif cty == "FOOTER":
+            footer_text = str(comp.get("text") or "")
+
+    refs: defaultdict = defaultdict(list)
+    for k, s, label in _iter_template_component_strings(t):
+        for m in re.findall(r"\{\{(\d+)\}\}", s or ""):
+            idx = int(m)
+            if k == "header":
+                refs[idx].append("Header")
+            elif k == "body":
+                refs[idx].append("Body")
+            elif k == "footer":
+                refs[idx].append("Footer")
+            elif k == "button_url" and label:
+                refs[idx].append(str(label))
+            else:
+                refs[idx].append("Button URL")
+
+    all_s = f"{header_text} {body_text} {footer_text} "
+    for k, s, _lab in _iter_template_component_strings(t):
+        if k == "button_url":
+            all_s += s
+    if not refs:
+        for m in re.findall(r"\{\{(\d+)\}\}", all_s):
+            refs[int(m)].append("Template")
+
+    all_idx = sorted(set(refs.keys())) if refs else _parse_body_variable_indices(all_s)
+
+    hints: dict = {}
+    for i in all_idx:
+        hlist = list(dict.fromkeys(refs.get(i) or [f"Variable {i}"]))
+        hints[str(i)] = ", ".join(hlist) if hlist else str(i)
+
+    # Small UI list: URL buttons with a dynamic part
+    button_preview = []
+    for comp in t.get("components") or []:
+        if (comp.get("type") or "").upper() == "BUTTONS":
+            for btn in comp.get("buttons") or []:
+                btxt = str((btn or {}).get("text") or "")
+                btype = str((btn or {}).get("type") or "").upper()
+                url = (btn or {}).get("url") or ""
+                if btype == "URL" and url and re.search(r"\{\{(\d+)\}\}", str(url)):
+                    button_preview.append(
+                        {
+                            "text": btxt,
+                            "url": str(url)[:200],
+                            "has_variables": bool(re.search(r"\{\{(\d+)\}\}", str(url))),
+                        }
+                    )
+                elif btype == "URL" and url:
+                    button_preview.append(
+                        {
+                            "text": btxt,
+                            "url": str(url)[:200],
+                            "has_variables": False,
+                        }
+                    )
+                elif btype == "QUICK_REPLY":
+                    button_preview.append(
+                        {
+                            "text": btxt,
+                            "type": "QUICK_REPLY",
+                        }
+                    )
+
+    lang = t.get("language")
+    if isinstance(lang, dict):
+        language = str(lang.get("code") or lang.get("id") or "en")
+    elif lang:
+        language = str(lang)
+    else:
+        language = "en"
+
+    return {
+        "name": t.get("name", ""),
+        "id": t.get("id", ""),
+        "status": t.get("status", ""),
+        "template": body_text,
+        "footer": footer_text,
+        "header": header_text,
+        "category": t.get("category", ""),
+        "language": language,
+        "all_variable_indices": all_idx,
+        "variable_hints": hints,
+        "button_preview": button_preview,
+    }
+
+
+def _build_processed_params_for_chatwoot(t: dict, user_values: dict) -> dict:
+    """
+    User fills one field per unique {{n}}. Map to Chatwoot `processed_params`:
+    body / header / footer (dicts with string keys "1".."n") and buttons: [{ "type": "url", "parameter": "…" }].
+    """
+    if not t or not isinstance(t, dict):
+        return {}
+    out = {}
+
+    header_text, body_text, footer_text = "", "", ""
+    for comp in t.get("components") or []:
+        cty = (comp.get("type") or "").upper()
+        cfmt = (comp.get("format") or "TEXT").upper()
+        if cty == "HEADER" and cfmt in ("", "TEXT") and (comp.get("text") is not None):
+            header_text = str(comp.get("text") or "")
+        elif cty == "BODY":
+            body_text = str(comp.get("text") or "")
+        elif cty == "FOOTER":
+            footer_text = str(comp.get("text") or "")
+
+    h_idx = _parse_body_variable_indices(header_text)
+    if h_idx:
+        out["header"] = {str(i): (user_values.get(str(i)) or "").strip() for i in sorted(h_idx)}
+
+    b_idx = _parse_body_variable_indices(body_text)
+    if b_idx:
+        out["body"] = {str(i): (user_values.get(str(i)) or "").strip() for i in sorted(b_idx)}
+
+    f_idx = _parse_body_variable_indices(footer_text)
+    if f_idx:
+        out["footer"] = {str(i): (user_values.get(str(i)) or "").strip() for i in sorted(f_idx)}
+
+    button_rows: list[dict] = []
+    for comp in t.get("components") or []:
+        if (comp.get("type") or "").upper() != "BUTTONS":
+            continue
+        for btn in comp.get("buttons") or []:
+            btype = str((btn or {}).get("type") or "").upper()
+            url = (btn or {}).get("url") or ""
+            if btype == "URL" and url and _parse_body_variable_indices(str(url)):
+                u_idx = _parse_body_variable_indices(str(url))
+                if not u_idx:
+                    continue
+                if len(u_idx) == 1:
+                    p = (user_values.get(str(u_idx[0])) or "").strip()
+                else:
+                    p = " ".join(
+                        (user_values.get(str(x)) or "").strip() for x in sorted(u_idx) if (user_values.get(str(x)) or "").strip()
+                    )
+                button_rows.append({"type": "url", "parameter": p or ""})
+    if button_rows:
+        out["buttons"] = button_rows
+    return out
 
 
 def _fill_template_body(body_text: str, body_params: dict) -> str:
@@ -1076,9 +1341,7 @@ def _fill_template_body(body_text: str, body_params: dict) -> str:
 def get_template_info(template_name: str, ctx: dict, inbox_id: int | None = None) -> dict:
     """
     Fetch template by name from Chatwoot inbox API. Validates template exists and
-    returns body variable indices (from BODY component {{1}}, {{2}}, etc.).
-    Returns dict with keys: name, body_variable_indices, language, category.
-    Raises if template not found.
+    returns all positional variable indices (header, body, footer, button URL {{n}}), plus raw template.
     """
     inbox_id = inbox_id if inbox_id is not None else ctx["inbox_id"]
     url = f"{ctx['base_url']}/api/v1/accounts/{ctx['account_id']}/inboxes/{inbox_id}"
@@ -1093,18 +1356,18 @@ def get_template_info(template_name: str, ctx: dict, inbox_id: int | None = None
 
     for t in message_templates:
         if t.get("name") == template_name:
-            body_text = ""
+            enriched = enrich_message_template(t)
+            body_text = enriched.get("template") or ""
             language = t.get("language", {}).get("code", "en") if isinstance(t.get("language"), dict) else t.get("language") or "en"
             category = t.get("category", "UTILITY")
-            for comp in t.get("components") or []:
-                if comp.get("type") == "BODY":
-                    body_text = comp.get("text") or ""
-                    break
             body_variable_indices = _parse_body_variable_indices(body_text)
             return {
                 "name": template_name,
+                "raw_template": t,
                 "body_text": body_text,
                 "body_variable_indices": body_variable_indices,
+                "all_variable_indices": enriched.get("all_variable_indices") or body_variable_indices,
+                "variable_hints": enriched.get("variable_hints") or {},
                 "language": language,
                 "category": category,
             }
@@ -1120,9 +1383,6 @@ def get_conversations(
     or GET /conversations with optional q= and inbox_id=.
     """
     phones = phone_numbers if phone_numbers is not None else []
-    print("PHONES")
-    print(phones)
-    print("PHONES")
     if phones:
         return _fetch_conversations_by_phone_filter(ctx, phones)
 
@@ -1139,48 +1399,97 @@ def get_conversations(
     resp.raise_for_status()
     return _parse_conversation_list_body(resp.json())
 
-def assignSelfToContactOnChatwootIfHaveAccount(phone_no):
-    ctx = _get_chatwoot_ctx()
+def assignSelfToContactOnChatwootIfHaveAccount(
+    phone_no,
+    username: str | None = None,
+    contact_name: str | None = None,
+):
+    """Assign a Chatwoot agent to the WhatsApp conversation for ``phone_no``.
+
+    ``username`` selects whose Chatwoot credentials/agent_id are used (defaults to
+    ``frappe.session.user``). ``contact_name`` is used as the Chatwoot contact display
+    name when the contact is created (existing contacts are not renamed); falls back to
+    ``phone_no`` when omitted.
+
+    Best-effort: creates the Chatwoot contact and/or conversation when missing, and skips
+    the assignment POST when the agent is already the assignee. Returns
+    ``{"success": bool, "message"?: str}`` and never raises so callers (e.g. the call
+    dispose flow / CRM Lead controller hook) can treat it as fire-and-forget. Errors
+    from upstream Chatwoot calls are caught and logged to the Frappe Error Log.
+    """
+    if phone_no is None or str(phone_no).strip() == "":
+        return {"success": False, "message": "phone_no is required"}
+    phone = str(phone_no).strip()
+
+    target_user = (username or "").strip() or None
+    ctx = _get_chatwoot_ctx(target_user)
     if ctx is None:
-        return {"success": False, "message": "Chatwoot is not configured for this user. Check Carrum chatwoot credentials."}
-    
-    agentId = ctx.get("agent_id")
-
-    if agentId is None:
-        return {"success": False, "message": "Agent ID is not configured for this user. Check Carrum chatwoot credentials."}
-        
-    contacts_info = get_contact(phone_no, ctx)
-
-    if not contacts_info:
-        return {'success': False, 'message': 'Contact not found'}
-
-    contact_id = None
-    if len(contacts_info) > 0 and contacts_info[0] is not None:
-        contact_id = contacts_info[0].get("id")
-
-    if contact_id is None:
-        return {'success': False, 'message': 'Contact not found'}
-
-    conversation = find_conversation(contact_id=contact_id, inbox_id=ctx.get('inbox_id'), ctx=ctx)
-
-    if not conversation:
-        return {'success': False, 'message': 'Conversation not found'}
-        
-    conversation_id = conversation.get("id")
+        return {
+            "success": False,
+            "message": "Chatwoot is not configured for this user. Check Carrum chatwoot credentials.",
+        }
 
     try:
-        want_id = int(agentId)
+        want_agent_id = int(ctx.get("agent_id"))
     except (TypeError, ValueError):
         return {
             "success": False,
             "message": "Agent ID is not configured for this user. Check Carrum chatwoot credentials.",
         }
 
-    already = _conversation_assignee_user_id(conversation)
-    if already is not None and already == want_id:
-        return {"success": True}
+    try:
+        contact_info = get_or_create_contact(phone, ctx, contact_name=contact_name)
+    except Exception as e:
+        frappe.log_error(frappe.get_traceback(), "chatwoot_get_or_create_contact")
+        return {"success": False, "message": f"Failed to resolve Chatwoot contact: {e}"}
 
-    assign_agent_to_conversation(conversation_id=conversation_id, agent_id=want_id, ctx=ctx)
+    contact_id = contact_info.get("contact_id")
+    inbox_id = contact_info.get("inbox_id") or ctx.get("inbox_id")
+    source_id = contact_info.get("source_id") or phone
+    if not contact_id or not inbox_id:
+        return {
+            "success": False,
+            "message": "Chatwoot contact resolution returned incomplete data",
+        }
+
+    try:
+        conversation_id = get_or_create_conversation(
+            contact_id=contact_id,
+            inbox_id=inbox_id,
+            source_id=source_id,
+            ctx=ctx,
+            phone_number=phone,
+        )
+    except Exception as e:
+        frappe.log_error(frappe.get_traceback(), "chatwoot_get_or_create_conversation")
+        return {
+            "success": False,
+            "message": f"Failed to resolve Chatwoot conversation: {e}",
+        }
+
+    # Skip assignment POST when the conversation is already owned by this agent.
+    try:
+        existing = get_conversation(contact_id, ctx) or []
+        current = next(
+            (c for c in existing if c.get("id") == conversation_id),
+            None,
+        )
+    except Exception:
+        current = None
+    already = _conversation_assignee_user_id(current)
+    if already is not None and already == want_agent_id:
+        return {"success": True, "message": "Already assigned"}
+
+    try:
+        assign_agent_to_conversation(
+            conversation_id=conversation_id,
+            agent_id=want_agent_id,
+            ctx=ctx,
+        )
+    except Exception as e:
+        frappe.log_error(frappe.get_traceback(), "chatwoot_assign_agent_to_conversation")
+        return {"success": False, "message": f"Failed to assign agent: {e}"}
+
     return {"success": True}
 
 
@@ -1210,6 +1519,9 @@ def _conversation_page_size(meta: dict, payload_len: int) -> int:
 
 @frappe.whitelist()
 def get_my_conversations(searchKey: str | int | None = None, page: int | str | None = 1):
+    return _get_my_conversations(searchKey, page)
+
+def _get_my_conversations(searchKey: str | int | None = None, page: int | str | None = 1):
     """
     List conversations assigned to the current agent (Chatwoot token user).
 
@@ -1300,3 +1612,41 @@ def get_my_conversations(searchKey: str | int | None = None, page: int | str | N
             "rows": rows,
         },
     }
+
+
+@frappe.whitelist()
+def update_last_seen_at(conversation_id: int | str | None = None):
+    if conversation_id is None or str(conversation_id).strip() == "":
+        return {"success": False, "message": _("Missing conversation_id")}
+    try:
+        conv_id = int(str(conversation_id).strip())
+    except (TypeError, ValueError):
+        return {"success": False, "message": _("Invalid conversation_id")}
+
+    ctx = _get_chatwoot_ctx()
+    if ctx is None:
+        return {
+            "success": False,
+            "message": "Chatwoot is not configured for this user. Check Carrum chatwoot credentials.",
+        }
+    try:
+        url = f"{ctx['base_url']}/api/v1/accounts/{ctx['account_id']}/conversations/{conv_id}/update_last_seen"
+        resp = requests.post(url, headers=ctx["headers"], timeout=30)
+        resp.raise_for_status()
+        payload = None
+        if resp.text and str(resp.text).strip():
+            try:
+                payload = resp.json()
+            except Exception:
+                payload = None
+        return {
+            "success": True,
+            "is_valid": True,
+            "reason": None,
+            "data": {},
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Failed to update last seen at: {e}",
+        }
