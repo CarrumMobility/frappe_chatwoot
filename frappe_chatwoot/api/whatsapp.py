@@ -154,7 +154,8 @@ def _chatwoot_api_message_to_crm_whatsapp_row(
     has_display = bool(body.strip()) or bool(attach_url) or bool(template_val)
     if not has_display:
         return None
-
+    failure_reason = msg.get("content_attributes")
+    failure_reason = failure_reason and isinstance(failure_reason, dict) and failure_reason.get("external_error") or None
     return {
         "name": str(msg.get("id")),
         "type": msg_type,
@@ -177,6 +178,7 @@ def _chatwoot_api_message_to_crm_whatsapp_row(
         "template_parameters": msg.get("template_parameters"),
         "template_header_parameters": msg.get("template_header_parameters"),
         "from_name": from_name or "Administrator",
+        "failure_reason": failure_reason
     }
 
 
@@ -259,6 +261,9 @@ def get_whatsapp_messages(reference_doctype: str, reference_name: str):
     if conversation_id:
         while True:
             raw_messages = get_messages(conversation_id, ctx, before_msg_id=lastMsgId)
+            # print("raw_messages")
+            # print(raw_messages)
+            # print("raw_messages")
             if len(raw_messages) == 0:
                 break
             lastMsgId = raw_messages[0].get("id")
