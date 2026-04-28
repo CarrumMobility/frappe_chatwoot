@@ -3,10 +3,12 @@ import random
 import re
 import sys
 import mimetypes
+import time
 from datetime import datetime, timezone
 from urllib.parse import unquote, urlparse, urlencode
 
 from core.api import carrum_accounts
+from core.services.apihit_service import api_hit_service
 import frappe
 import requests
 from frappe import _
@@ -14,6 +16,84 @@ from frappe import _
 LEAD_DOCTYPE = "CRM Lead"
 DEAL_DOCTYPE = "CRM Deal"
 FRAPPE_CHATWOOT_MESSAGE_TYPE_MAPPING = {1: "Outgoing", 2: "Incoming"}
+
+
+def _chatwoot_response_body_for_log(response: requests.Response | None):
+    if response is None:
+        return None
+    try:
+        return response.json()
+    except (ValueError, TypeError):
+        return response.text
+
+
+def _chatwoot_request_headers_for_log(response: requests.Response | None) -> dict | None:
+    """Request headers as sent (from requests prepared request)."""
+    if response is None or not getattr(response, "request", None):
+        return None
+    try:
+        return dict(response.request.headers)
+    except (TypeError, ValueError):
+        return None
+
+
+def _chatwoot_created_by_user() -> str | None:
+    user = None
+    if getattr(frappe.local, "session", None):
+        user = frappe.session.get("user")
+    return user if user and user not in (None, "Guest") else None
+
+
+def _chatwoot_request_payload_for_log(kwargs: dict, explicit_payload=None):
+    if explicit_payload is not None:
+        return explicit_payload
+    payload = {}
+    if "params" in kwargs:
+        payload["params"] = kwargs.get("params")
+    if "json" in kwargs:
+        payload["json"] = kwargs.get("json")
+    if "data" in kwargs:
+        payload["data"] = kwargs.get("data")
+    if "files" in kwargs:
+        files = kwargs.get("files")
+        payload["files"] = list(files.keys()) if isinstance(files, dict) else str(type(files))
+    return payload or None
+
+
+def _chatwoot_api_request(
+    method: str,
+    url: str,
+    *,
+    api_operation: str = "request",
+    request_payload=None,
+    **kwargs,
+) -> requests.Response:
+    t0 = time.perf_counter()
+    response = None
+    err_message = None
+    try:
+        response = requests.request(method=method.upper(), url=url, **kwargs)
+        if not response.ok:
+            err_message = "HTTP not OK"
+        return response
+    except Exception as ex:
+        err_message = str(ex)
+        raise
+    finally:
+        try:
+            api_hit_service.enqueue_log_api_hit(
+                f"Chatwoot:{api_operation}",
+                str(url),
+                _chatwoot_request_headers_for_log(response),
+                _chatwoot_request_payload_for_log(kwargs, request_payload),
+                _chatwoot_response_body_for_log(response),
+                int(response.status_code) if response is not None else 0,
+                err_message,
+                round(time.perf_counter() - t0, 4),
+                created_by=_chatwoot_created_by_user(),
+            )
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), "Chatwoot api_hit enqueue")
 
 
 def _get_chatwoot_ctx(username: str | None = None) -> dict | None:
@@ -637,8 +717,10 @@ def _fetch_conversations_by_phone_filter(ctx: dict, phones: list[str]) -> list[d
     for page in range(1, max_pages + 1):
         url = f"{base}?{urlencode({'page': page})}"
         print("URL: " + url)
-        resp = requests.post(
+        resp = _chatwoot_api_request(
+            "POST",
             url,
+            api_operation="conversations_filter",
             headers=ctx["headers"],
             json={"payload": payload_filters},
         )
@@ -749,8 +831,10 @@ def assign_whatsapp_inbox_to_contact(contact_id: int, ctx: dict, source_id: str)
     print("assign inbox to contact url: " + url)
     payload = {"inbox_id": inbox_id_int, "source_id": source}
     print("payload: " + str(payload))
-    resp = requests.post(
+    resp = _chatwoot_api_request(
+        "POST",
         url,
+        api_operation="assign_contact_inbox",
         headers=ctx["headers"],
         json=payload
     )
@@ -804,8 +888,10 @@ def find_contact(phone_no: str, ctx: dict) -> dict:
     search_url = (
         f"{ctx['base_url']}/api/v1/accounts/{ctx['account_id']}/contacts/search?page=1&q={phone_no}"
     )
-    resp = requests.get(
+    resp = _chatwoot_api_request(
+        "GET",
         search_url,
+        api_operation="search_contact",
         headers={"api_access_token": ctx["api_access_token"]},
     )
     resp.raise_for_status()
@@ -837,8 +923,10 @@ def get_or_create_contact(
             raise
     display_name = (str(contact_name).strip() if contact_name is not None else "") or phone_no
     create_url = f"{ctx['base_url']}/api/v1/accounts/{ctx['account_id']}/contacts"
-    create_resp = requests.post(
+    create_resp = _chatwoot_api_request(
+        "POST",
         create_url,
+        api_operation="create_contact",
         headers=ctx["headers"],
         json={
             "inbox_id": ctx["inbox_id"],
@@ -859,7 +947,12 @@ def get_or_create_contact(
 
 def get_contact(phone_no: str, ctx: dict) -> dict:
     url = f"{ctx['base_url']}/api/v1/accounts/{ctx['account_id']}/contacts/search?page=1&q={phone_no}"
-    resp = requests.get(url, headers=ctx["headers"])
+    resp = _chatwoot_api_request(
+        "GET",
+        url,
+        api_operation="search_contact",
+        headers=ctx["headers"],
+    )
     resp.raise_for_status()
     data = resp.json()
     return data.get("payload", data)
@@ -871,7 +964,12 @@ def get_conversation(contact_id: int, ctx: dict) -> list | None:
     Returns conversations list if found, else None.
     """
     list_url = f"{ctx['base_url']}/api/v1/accounts/{ctx['account_id']}/contacts/{contact_id}/conversations"
-    resp = requests.get(list_url, headers=ctx["headers"])
+    resp = _chatwoot_api_request(
+        "GET",
+        list_url,
+        api_operation="list_contact_conversations",
+        headers=ctx["headers"],
+    )
     if resp.status_code == 404:
         raise Exception("Contact not found while fetching conversations")
     resp.raise_for_status()
@@ -896,7 +994,13 @@ def create_conversation(
         body["custom_attributes"] = {"phoneNumber": pn}
     if initial_message:
         body["message"] = {"content": initial_message}
-    conv_resp = requests.post(create_url, headers=ctx["headers"], json=body)
+    conv_resp = _chatwoot_api_request(
+        "POST",
+        create_url,
+        api_operation="create_conversation",
+        headers=ctx["headers"],
+        json=body,
+    )
     conv_resp.raise_for_status()
     conv_data = conv_resp.json()
     return conv_data["id"]
@@ -1057,11 +1161,25 @@ def send_message(
             "private": "false",
         }
         files = {"attachments[]": (filename, file_bytes, mime)}
-        resp = requests.post(url, headers=headers, data=data, files=files, timeout=120)
+        resp = _chatwoot_api_request(
+            "POST",
+            url,
+            api_operation="send_message",
+            headers=headers,
+            data=data,
+            files=files,
+            timeout=120,
+        )
         resp.raise_for_status()
         return resp.json()
 
-    resp = requests.post(url, headers=ctx["headers"], json={"content": text})
+    resp = _chatwoot_api_request(
+        "POST",
+        url,
+        api_operation="send_message",
+        headers=ctx["headers"],
+        json={"content": text},
+    )
     resp.raise_for_status()
     return resp.json()
 
@@ -1096,7 +1214,13 @@ def send_template_message(
         },
     }
     url = f"{ctx['base_url']}/api/v1/accounts/{ctx['account_id']}/conversations/{conversation_id}/messages"
-    resp = requests.post(url, headers=ctx["headers"], json=payload)
+    resp = _chatwoot_api_request(
+        "POST",
+        url,
+        api_operation="send_template_message",
+        headers=ctx["headers"],
+        json=payload,
+    )
     resp.raise_for_status()
     return resp.json()
 
@@ -1115,7 +1239,12 @@ def get_messages(
     url = f"{ctx['base_url']}/api/v1/accounts/{ctx['account_id']}/conversations/{conversation_id}/messages"
     if before_msg_id:
         url = f"{url}?before={before_msg_id}"
-    resp = requests.get(url, headers=ctx["headers"])
+    resp = _chatwoot_api_request(
+        "GET",
+        url,
+        api_operation="get_messages",
+        headers=ctx["headers"],
+    )
     resp.raise_for_status()
     data = resp.json()
     return data.get("payload") or []
@@ -1350,7 +1479,12 @@ def get_template_info(template_name: str, ctx: dict, inbox_id: int | None = None
     """
     inbox_id = inbox_id if inbox_id is not None else ctx["inbox_id"]
     url = f"{ctx['base_url']}/api/v1/accounts/{ctx['account_id']}/inboxes/{inbox_id}"
-    resp = requests.get(url, headers=ctx["headers"])
+    resp = _chatwoot_api_request(
+        "GET",
+        url,
+        api_operation="get_inbox_templates",
+        headers=ctx["headers"],
+    )
     resp.raise_for_status()
     data = resp.json()
     payload = data.get("payload")
@@ -1400,7 +1534,12 @@ def get_conversations(
         query_parts.append(("inbox_id", str(inbox_id).strip()))
 
     url = f"{base_url}?{urlencode(query_parts)}" if query_parts else base_url
-    resp = requests.get(url, headers=ctx["headers"])
+    resp = _chatwoot_api_request(
+        "GET",
+        url,
+        api_operation="list_conversations",
+        headers=ctx["headers"],
+    )
     resp.raise_for_status()
     return _parse_conversation_list_body(resp.json())
 
@@ -1501,7 +1640,13 @@ def assignSelfToContactOnChatwootIfHaveAccount(
 def assign_agent_to_conversation(conversation_id: int, agent_id: int, ctx: dict):
     # https://chatwoot-dev.carrum.co.in/api/v1/accounts/1/conversations/2/assignments
     url = f"{ctx['base_url']}/api/v1/accounts/{ctx['account_id']}/conversations/{conversation_id}/assignments"
-    resp = requests.post(url, headers=ctx["headers"], json={"assignee_id": agent_id})
+    resp = _chatwoot_api_request(
+        "POST",
+        url,
+        api_operation="assign_conversation",
+        headers=ctx["headers"],
+        json={"assignee_id": agent_id},
+    )
     resp.raise_for_status()
     return resp.json()
 
@@ -1576,7 +1721,14 @@ def _get_my_conversations(searchKey: str | int | None = None, page: int | str | 
 
     url = f"{ctx['base_url']}/api/v1/accounts/{ctx['account_id']}/conversations"
     try:
-        resp = requests.get(url, headers=ctx["headers"], params=params, timeout=60)
+        resp = _chatwoot_api_request(
+            "GET",
+            url,
+            api_operation="list_my_conversations",
+            headers=ctx["headers"],
+            params=params,
+            timeout=60,
+        )
         resp.raise_for_status()
     except requests.RequestException as e:
         return {"success": False, "message": str(e)}
@@ -1636,7 +1788,13 @@ def update_last_seen_at(conversation_id: int | str | None = None):
         }
     try:
         url = f"{ctx['base_url']}/api/v1/accounts/{ctx['account_id']}/conversations/{conv_id}/update_last_seen"
-        resp = requests.post(url, headers=ctx["headers"], timeout=30)
+        resp = _chatwoot_api_request(
+            "POST",
+            url,
+            api_operation="update_last_seen",
+            headers=ctx["headers"],
+            timeout=30,
+        )
         resp.raise_for_status()
         payload = None
         if resp.text and str(resp.text).strip():
