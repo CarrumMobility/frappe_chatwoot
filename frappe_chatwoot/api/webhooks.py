@@ -3,6 +3,7 @@ import logging
 import frappe
 
 from frappe_chatwoot.api.whatsapp import _chatwoot_message_list_meta, _format_chat_list_timestamp
+from frappe_chatwoot.api.whatsapp_viewers import get_active_viewer_users
 from crm.integrations.api import get_contact_lead_or_deal_from_number
 
 # Frappe's default logger level is WARNING (dev) or ERROR (prod), so INFO never reaches the file.
@@ -141,7 +142,12 @@ def _resolve_reference_and_emit_whatsapp_message():
 		deal_owner = frappe.db.get_value("CRM Deal", reference_name, "deal_owner")
 
 	chat_list = _build_chat_list_patch(payload, phone)
-	
+
+	if telecaller_user is None:
+		# frappe.enqueue(
+		# 	"frappe_crm.api."
+		# )
+		pass
 	if chat_list is not None:
 		chat_list["display_name"] = _list_display_name(
 			reference_doctype, reference_name, chat_list.get("phone_number") or phone
@@ -156,17 +162,48 @@ def _resolve_reference_and_emit_whatsapp_message():
 	if deal_owner is not None:
 		message_detail["deal_owner"] = deal_owner
 
+	conv_id = None
+	if chat_list and chat_list.get("conversation_id") is not None:
+		conv_id = chat_list.get("conversation_id")
+	else:
+		msg, conversation = _extract_message_and_conversation(payload)
+		conv_id = (conversation or {}).get("id")
+		if conv_id is None and isinstance(msg, dict):
+			conv_id = msg.get("conversation_id")
+	if conv_id is not None:
+		message_detail["conversation_id"] = conv_id
+
 	message_list = {**message_detail, "chat_list": chat_list}
 
 	list_user = _chat_list_recipient(reference_doctype, reference_name)
-	
+
 	if list_user:
 		frappe.publish_realtime("whatsapp_message_list", message_list, user=list_user)
 
-	if reference_doctype in ("CRM Lead", "CRM Deal"):
+	# CRM Lead: user-targeted whatsapp_message for active thread viewers; else doc room fallback
+	if (
+		reference_doctype == "CRM Lead"
+		and message_detail.get("conversation_id") is not None
+	):
+		viewer_users = get_active_viewer_users(message_detail["conversation_id"])
+		if viewer_users:
+			for u in viewer_users:
+				if u and u != "Guest":
+					frappe.publish_realtime("whatsapp_message", message_detail, user=u)
+		else:
+			frappe.publish_realtime(
+				"whatsapp_message",
+				message_detail,
+				doctype="CRM Lead",
+				docname=reference_name,
+			)
+	else:
+		# Non-Lead (e.g. CRM Deal) — unchanged: document room
 		frappe.publish_realtime(
 			"whatsapp_message",
 			message_detail,
+			doctype="CRM Lead",
+			docname=reference_name,
 		)
 
 
