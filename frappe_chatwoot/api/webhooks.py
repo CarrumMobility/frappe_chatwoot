@@ -1,8 +1,13 @@
 import logging
 
+from core.api.carrum_accounts import get_users_by_inbox_id
 import frappe
-
-from frappe_chatwoot.api.whatsapp import _chatwoot_message_list_meta, _format_chat_list_timestamp
+import random
+from frappe_chatwoot.api.whatsapp import (
+	_chatwoot_message_list_meta,
+	_format_chat_list_timestamp,
+	assign_chatwoot_conversation_to_frappe_user,
+)
 from frappe_chatwoot.api.whatsapp_viewers import get_active_viewer_users
 from crm.integrations.api import get_contact_lead_or_deal_from_number
 
@@ -117,6 +122,22 @@ def _build_chat_list_patch(payload: dict, phone: str | None) -> dict | None:
 	}
 
 
+def maybe_assign_telecaller_to_lead(inbox_id, lead_id):
+	"""Pick a telecaller from Carrum inbox users and set CRM Lead.telecaller. Returns Frappe username or None."""
+	users = [u for u in get_users_by_inbox_id(inbox_id) if u and str(u).strip()]
+	if not users:
+		log.info(
+			"maybe_assign_telecaller_to_lead: no users for inbox_id=%s lead=%s",
+			inbox_id,
+			lead_id,
+		)
+		return None
+	assignable_telecaller = users[random.randint(0, len(users) - 1)]
+	frappe.db.set_value("CRM Lead", lead_id, "telecaller", assignable_telecaller)
+	return assignable_telecaller
+
+
+
 def _resolve_reference_and_emit_whatsapp_message():
 	"""
 	Emit two realtime events:
@@ -133,21 +154,46 @@ def _resolve_reference_and_emit_whatsapp_message():
 	reference_name, reference_doctype = get_contact_lead_or_deal_from_number(phone)
 	if not reference_name or not reference_doctype:
 		return
-	
+
+	msg, conversation = _extract_message_and_conversation(payload)
+	inbox_id = conversation.get("inbox_id") or msg.get("inbox_id")
+	conv_id_raw = conversation.get("id")
+	if conv_id_raw is None:
+		conv_id_raw = msg.get("conversation_id")
+
 	telecaller_user = None
 	deal_owner = None
 	if reference_doctype == "CRM Lead":
+		lead_type = frappe.db.get_value("CRM Lead", reference_name, "lead_type")
 		telecaller_user = frappe.db.get_value("CRM Lead", reference_name, "telecaller")
+		unassigned = not telecaller_user or str(telecaller_user).strip() in ("", "Guest")
+		if lead_type == "LEAD" and unassigned and inbox_id is not None:
+			try:
+				inbox_int = int(inbox_id)
+			except (TypeError, ValueError):
+				inbox_int = None
+			if inbox_int is not None:
+				assigned = maybe_assign_telecaller_to_lead(inbox_int, reference_name)
+				telecaller_user = frappe.db.get_value("CRM Lead", reference_name, "telecaller")
+				if assigned and conv_id_raw is not None:
+					try:
+						conv_int = int(conv_id_raw)
+					except (TypeError, ValueError):
+						conv_int = None
+					if conv_int is not None:
+						ok = assign_chatwoot_conversation_to_frappe_user(assigned, conv_int)
+						if ok:
+							log.info(
+								"Assigned Chatwoot conversation %s to telecaller %s for lead %s",
+								conv_int,
+								assigned,
+								reference_name,
+							)
 	elif reference_doctype == "CRM Deal":
 		deal_owner = frappe.db.get_value("CRM Deal", reference_name, "deal_owner")
 
 	chat_list = _build_chat_list_patch(payload, phone)
 
-	if telecaller_user is None:
-		# frappe.enqueue(
-		# 	"frappe_crm.api."
-		# )
-		pass
 	if chat_list is not None:
 		chat_list["display_name"] = _list_display_name(
 			reference_doctype, reference_name, chat_list.get("phone_number") or phone
@@ -198,7 +244,6 @@ def _resolve_reference_and_emit_whatsapp_message():
 				docname=reference_name,
 			)
 	else:
-		# Non-Lead (e.g. CRM Deal) — unchanged: document room
 		frappe.publish_realtime(
 			"whatsapp_message",
 			message_detail,

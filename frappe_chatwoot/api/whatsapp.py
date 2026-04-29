@@ -1709,6 +1709,32 @@ def assign_agent_to_conversation(conversation_id: int, agent_id: int, ctx: dict)
     return resp.json()
 
 
+def assign_chatwoot_conversation_to_frappe_user(frappe_username: str, conversation_id: int) -> bool:
+    """Assign a Chatwoot conversation to the agent linked to this Frappe user (Carrum chatwootCred).
+
+    Uses that user's API token to POST ``assignments`` with their ``agentId``. Safe for guest
+    webhooks (no session); failures are logged and do not raise.
+    """
+    if not frappe_username or not str(frappe_username).strip() or not conversation_id:
+        return False
+    ctx = _get_chatwoot_ctx(str(frappe_username).strip())
+    if ctx is None:
+        return False
+    try:
+        agent_id = int(ctx.get("agent_id"))
+    except (TypeError, ValueError):
+        return False
+    try:
+        assign_agent_to_conversation(conversation_id, agent_id, ctx)
+        return True
+    except Exception:
+        frappe.log_error(
+            frappe.get_traceback(),
+            "assign_chatwoot_conversation_to_frappe_user",
+        )
+        return False
+
+
 def _conversation_page_size(meta: dict, payload_len: int) -> int:
     """Infer page size from Chatwoot list meta or payload length."""
     for key in ("per_page", "page_limit", "limit"):
