@@ -789,12 +789,30 @@ def _sanitize_phone(phoneNo: str):
         raise Exception("Invalid Phone number Length")
     return phoneNo.replace("+91", "")
 
+def _normalize_chatwoot_whatsapp_source_id(value: str | int | None) -> str:
+    """
+    Chatwoot Channel::Whatsapp validates source_id with WHATSAPP_CHANNEL_REGEX (digits only, length 1–15).
+    Strip +, spaces, dashes, and any non-ASCII-digit characters so API accepts the value.
+    """
+    if value is None:
+        return ""
+    s = re.sub(r"[^0-9]", "", str(value).strip().replace("+", ""))
+    if len(s) > 15:
+        frappe.throw(
+            "WhatsApp source_id must be 1–15 digits after normalization (E.164 without +). "
+            f"Got {len(s)} digit(s)."
+        )
+    return s
+
+
 def _contact_whatsapp_source_id(contact: dict) -> str | None:
-    """Phone / identifier Chatwoot uses as WhatsApp source_id (E.164 or channel-specific)."""
+    """Phone / identifier Chatwoot uses as WhatsApp source_id (E.164 digits only, no +)."""
     for key in ("phone_number", "identifier"):
         val = contact.get(key)
         if val is not None and str(val).strip():
-            return str(val).strip().replace("+", "")
+            normalized = _normalize_chatwoot_whatsapp_source_id(val)
+            if normalized:
+                return normalized
     return None
 
 
@@ -812,7 +830,7 @@ def assign_whatsapp_inbox_to_contact(contact_id: int, ctx: dict, source_id: str)
     except (TypeError, ValueError):
         frappe.throw("Invalid inbox_id in Chatwoot context.")
 
-    source = str(source_id).strip()
+    source = _normalize_chatwoot_whatsapp_source_id(source_id)
     if not source:
         frappe.throw("source_id (contact number) is required to assign WhatsApp inbox.")
 
@@ -827,6 +845,7 @@ def assign_whatsapp_inbox_to_contact(contact_id: int, ctx: dict, source_id: str)
         api_operation="assign_contact_inbox",
         headers=ctx["headers"],
         json=payload,
+        request_payload=payload,
     )
     resp.raise_for_status()
     raw = resp.json()
