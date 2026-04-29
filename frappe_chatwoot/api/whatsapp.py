@@ -816,11 +816,57 @@ def _contact_whatsapp_source_id(contact: dict) -> str | None:
     return None
 
 
+def _contact_phone_matches_whatsapp_digits(contact: dict, digits: str) -> bool:
+    """True if Chatwoot contact phone_number or identifier normalizes to the same WhatsApp digits."""
+    if not digits:
+        return False
+    pn = _normalize_chatwoot_whatsapp_source_id(contact.get("phone_number"))
+    ident = _normalize_chatwoot_whatsapp_source_id(contact.get("identifier"))
+    return pn == digits or ident == digits
+
+
+def _chatwoot_get_contact(contact_id: int, ctx: dict) -> dict:
+    url = f"{ctx['base_url']}/api/v1/accounts/{ctx['account_id']}/contacts/{contact_id}"
+    resp = _chatwoot_api_request(
+        "GET",
+        url,
+        api_operation="get_contact",
+        headers=ctx["headers"],
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    payload = data.get("payload", data)
+    if isinstance(payload, list):
+        payload = payload[0] if payload else {}
+    if not isinstance(payload, dict):
+        frappe.throw("Unexpected Chatwoot response when loading contact.")
+    return payload
+
+
+def _chatwoot_patch_contact_phone(contact_id: int, ctx: dict, digits: str) -> None:
+    """Set phone_number (+E.164) so Chatwoot's ContactInboxBuilder can derive WhatsApp source_id."""
+    url = f"{ctx['base_url']}/api/v1/accounts/{ctx['account_id']}/contacts/{contact_id}"
+    body = {"phone_number": f"+{digits}"}
+    resp = _chatwoot_api_request(
+        "PATCH",
+        url,
+        api_operation="patch_contact_phone",
+        headers=ctx["headers"],
+        json=body,
+        request_payload=body,
+    )
+    resp.raise_for_status()
+
+
 def assign_whatsapp_inbox_to_contact(contact_id: int, ctx: dict, source_id: str) -> dict:
     """
     POST /accounts/:account_id/contacts/:id/contact_inboxes — link the site WhatsApp inbox
-    to an existing contact. source_id is the customer's WhatsApp identifier (contact number).
-    Returns a contact_inbox-shaped dict (nested inbox + source_id) for _parse_contact_info.
+    to an existing contact.
+
+    Chatwoot accepts optional ``source_id``; when omitted, ``ContactInboxBuilder`` sets it from
+    ``contact.phone_number`` (digits without ``+``). Sending ``source_id`` in the JSON body can
+    still hit validation edge cases; we therefore align ``phone_number`` with the intended WhatsApp
+    identifier, then POST only ``inbox_id`` so the server generates a valid ``source_id``.
     """
     inbox_id = ctx.get("inbox_id")
     if inbox_id is None or inbox_id == "":
@@ -834,11 +880,15 @@ def assign_whatsapp_inbox_to_contact(contact_id: int, ctx: dict, source_id: str)
     if not source:
         frappe.throw("source_id (contact number) is required to assign WhatsApp inbox.")
 
+    cw_contact = _chatwoot_get_contact(contact_id, ctx)
+    if not _contact_phone_matches_whatsapp_digits(cw_contact, source):
+        _chatwoot_patch_contact_phone(contact_id, ctx, source)
+
     url = (
         f"{ctx['base_url']}/api/v1/accounts/{ctx['account_id']}/contacts/"
         f"{contact_id}/contact_inboxes"
     )
-    payload = {"inbox_id": inbox_id_int, "source_id": source}
+    payload = {"inbox_id": inbox_id_int}
     resp = _chatwoot_api_request(
         "POST",
         url,
