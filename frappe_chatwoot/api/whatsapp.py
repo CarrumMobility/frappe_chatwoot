@@ -107,7 +107,7 @@ def _get_chatwoot_ctx(username: str | None = None) -> dict | None:
     if account_id is None:
         frappe.throw("Chatwoot account id is not configured (chatwoot_account_id).")
     base_url = (frappe.conf.get("chatwoot_base_url") or "").rstrip("/")
-    print('cfg: ' + str(cfg))
+    
     token = (cfg.token or "").strip()
     if not token:
         return None
@@ -341,9 +341,6 @@ def get_whatsapp_messages(reference_doctype: str, reference_name: str):
     if conversation_id:
         while True:
             raw_messages = get_messages(conversation_id, ctx, before_msg_id=lastMsgId)
-            # print("raw_messages")
-            # print(raw_messages)
-            # print("raw_messages")
             if len(raw_messages) == 0:
                 break
             lastMsgId = raw_messages[0].get("id")
@@ -708,15 +705,13 @@ def _fetch_conversations_by_phone_filter(ctx: dict, phones: list[str]) -> list[d
         "values": phones,
     })
 
-    print(payload_filters)
     base = f"{ctx['base_url']}/api/v1/accounts/{ctx['account_id']}/conversations/filter"
     merged: list[dict] = []
     seen_ids: set = set()
     max_pages = 50
-    print(ctx["headers"])
+    
     for page in range(1, max_pages + 1):
         url = f"{base}?{urlencode({'page': page})}"
-        print("URL: " + url)
         resp = _chatwoot_api_request(
             "POST",
             url,
@@ -724,11 +719,9 @@ def _fetch_conversations_by_phone_filter(ctx: dict, phones: list[str]) -> list[d
             headers=ctx["headers"],
             json={"payload": payload_filters},
         )
-        print("RESPONSE: " + str(resp.json()))
         resp.raise_for_status()
         # batch = _parse_conversation_list_body(resp.json())
         batch = resp.json().get("payload") or []
-        print("BATCH: " + str(batch))
         if not batch:
             break
         for c in batch:
@@ -756,7 +749,6 @@ def get_chat_list_by_phoneNumbers(searchKey=None, phoneNumbers=None):
         frappe.throw("Chatwoot is not configured for this user. Check Carrum chatwoot credentials.")
 
     raw_list = get_conversations(ctx, search=search_val, phone_numbers=phones)
-    print("RAW LIST: " + str(raw_list))
     inbox_id = ctx.get("inbox_id")
     if inbox_id is not None and inbox_id != "":
         try:
@@ -828,15 +820,13 @@ def assign_whatsapp_inbox_to_contact(contact_id: int, ctx: dict, source_id: str)
         f"{ctx['base_url']}/api/v1/accounts/{ctx['account_id']}/contacts/"
         f"{contact_id}/contact_inboxes"
     )
-    print("assign inbox to contact url: " + url)
     payload = {"inbox_id": inbox_id_int, "source_id": source}
-    print("payload: " + str(payload))
     resp = _chatwoot_api_request(
         "POST",
         url,
         api_operation="assign_contact_inbox",
         headers=ctx["headers"],
-        json=payload
+        json=payload,
     )
     resp.raise_for_status()
     raw = resp.json()
@@ -897,7 +887,6 @@ def find_contact(phone_no: str, ctx: dict) -> dict:
     resp.raise_for_status()
     data = resp.json()
     payload = data.get("payload") or []
-    print("CONTACT SEARCH PAYLOAD: " + str(payload), file=sys.stderr, flush=True)
     if len(payload) == 0:
         raise Exception(f"Contact not found for phone {phone_no}")
     # if len(payload) > 1:
