@@ -1,6 +1,7 @@
 import logging
 
 from core.api.carrum_accounts import get_users_by_inbox_id
+from core.constants.enums import EnumValues
 import frappe
 import random
 from frappe_chatwoot.api.whatsapp import (
@@ -9,7 +10,7 @@ from frappe_chatwoot.api.whatsapp import (
 	assign_chatwoot_conversation_to_frappe_user,
 )
 from frappe_chatwoot.api.whatsapp_viewers import get_active_viewer_users
-from crm.integrations.api import get_contact_lead_or_deal_from_number
+from crm.integrations.api import findOrCreateLead
 
 # Frappe's default logger level is WARNING (dev) or ERROR (prod), so INFO never reaches the file.
 # See frappe.utils.logger.default_log_level / get_logger().
@@ -151,8 +152,15 @@ def _resolve_reference_and_emit_whatsapp_message():
 	if not phone:
 		return
 
-	reference_name, reference_doctype = get_contact_lead_or_deal_from_number(phone)
-	if not reference_name or not reference_doctype:
+	source = frappe.db.get_value("CRM Lead Source", {'is_whatsapp_source': 1}, 'source_name')
+	if not source:
+		log.info("No WhatsApp source found")
+		return
+	
+	reference_doc = findOrCreateLead(mobileNo=phone, source=source)
+	reference_doctype = "CRM Lead"
+	if not reference_doc:
+		log.info("findOrCreateLead failed for phone: %s", phone)
 		return
 
 	msg, conversation = _extract_message_and_conversation(payload)
@@ -163,18 +171,22 @@ def _resolve_reference_and_emit_whatsapp_message():
 
 	telecaller_user = None
 	deal_owner = None
-	if reference_doctype == "CRM Lead":
-		lead_type = frappe.db.get_value("CRM Lead", reference_name, "lead_type")
-		telecaller_user = frappe.db.get_value("CRM Lead", reference_name, "telecaller")
+	
+	if reference_doc.doctype == "CRM Lead":
+		lead_type = reference_doc.lead_type
+		telecaller_user = reference_doc.telecaller
 		unassigned = not telecaller_user or str(telecaller_user).strip() in ("", "Guest")
-		if lead_type == "LEAD" and unassigned and inbox_id is not None:
+		print("lead_type :", lead_type)
+		if lead_type == EnumValues.LeadType.LEAD and unassigned and inbox_id is not None:
 			try:
 				inbox_int = int(inbox_id)
 			except (TypeError, ValueError):
 				inbox_int = None
 			if inbox_int is not None:
-				assigned = maybe_assign_telecaller_to_lead(inbox_int, reference_name)
-				telecaller_user = frappe.db.get_value("CRM Lead", reference_name, "telecaller")
+				
+				assigned = maybe_assign_telecaller_to_lead(inbox_int, reference_doc.name)
+				telecaller_user = reference_doc.telecaller
+
 				if assigned and conv_id_raw is not None:
 					try:
 						conv_int = int(conv_id_raw)
@@ -182,26 +194,27 @@ def _resolve_reference_and_emit_whatsapp_message():
 						conv_int = None
 					if conv_int is not None:
 						ok = assign_chatwoot_conversation_to_frappe_user(assigned, conv_int)
+						print("Ok: ",ok)
 						if ok:
 							log.info(
 								"Assigned Chatwoot conversation %s to telecaller %s for lead %s",
 								conv_int,
 								assigned,
-								reference_name,
+								reference_doc.name,
 							)
 	elif reference_doctype == "CRM Deal":
-		deal_owner = frappe.db.get_value("CRM Deal", reference_name, "deal_owner")
+		deal_owner = frappe.db.get_value("CRM Deal", reference_doc.name, "deal_owner")
 
 	chat_list = _build_chat_list_patch(payload, phone)
 
 	if chat_list is not None:
 		chat_list["display_name"] = _list_display_name(
-			reference_doctype, reference_name, chat_list.get("phone_number") or phone
+			reference_doctype, reference_doc.name, chat_list.get("phone_number") or phone
 		)
 
 	message_detail = {
 		"reference_doctype": reference_doctype,
-		"reference_name": reference_name,
+		"reference_name": reference_doc.name,
 	}
 	if telecaller_user is not None:
 		message_detail["telecaller"] = telecaller_user
@@ -216,12 +229,13 @@ def _resolve_reference_and_emit_whatsapp_message():
 		conv_id = (conversation or {}).get("id")
 		if conv_id is None and isinstance(msg, dict):
 			conv_id = msg.get("conversation_id")
+	
 	if conv_id is not None:
 		message_detail["conversation_id"] = conv_id
 
 	message_list = {**message_detail, "chat_list": chat_list}
 
-	list_user = _chat_list_recipient(reference_doctype, reference_name)
+	list_user = _chat_list_recipient(reference_doctype, reference_doc.name)
 
 	if list_user:
 		frappe.publish_realtime("whatsapp_message_list", message_list, user=list_user)
@@ -241,15 +255,18 @@ def _resolve_reference_and_emit_whatsapp_message():
 				"whatsapp_message",
 				message_detail,
 				doctype="CRM Lead",
-				docname=reference_name,
+				docname=reference_doc.name,
 			)
 	else:
 		frappe.publish_realtime(
 			"whatsapp_message",
 			message_detail,
 			doctype="CRM Lead",
-			docname=reference_name,
+			docname=reference_doc.name,
 		)
+
+	frappe.db.commit()
+	return True
 
 
 @frappe.whitelist()
