@@ -1,43 +1,272 @@
+import logging
+
+from core.api.carrum_accounts import get_users_by_inbox_id
+from core.constants.enums import EnumValues
 import frappe
+import random
+from frappe_chatwoot.api.whatsapp import (
+	_chatwoot_message_list_meta,
+	_format_chat_list_timestamp,
+	assign_chatwoot_conversation_to_frappe_user,
+)
+from frappe_chatwoot.api.whatsapp_viewers import get_active_viewer_users
+from crm.integrations.api import findOrCreateLead
+
+# Frappe's default logger level is WARNING (dev) or ERROR (prod), so INFO never reaches the file.
+# See frappe.utils.logger.default_log_level / get_logger().
+log = frappe.logger("frappe_chatwoot:webhooks")
+log.setLevel(logging.INFO)
+
+
+def _get_chatwoot_webhook_payload() -> dict:
+	"""Parse JSON body (Chatwoot) or fall back to form_dict."""
+	req = frappe.request
+	data = req.get_json(silent=True)
+	if isinstance(data, dict) and data:
+		return data
+	return dict(frappe.form_dict or {})
 
 
 def _get_phone_from_payload(payload):
 	"""Extract phone number from Chatwoot webhook payload."""
+	log.info("Payload: " + str(payload))
 	conversation = payload.get("conversation") or {}
 	# contact_inbox.source_id e.g. "917004617522"
 	source_id = (conversation.get("contact_inbox") or {}).get("source_id")
 	if source_id:
-		return source_id
+		return str(source_id)
 	# meta.sender.phone_number e.g. "+917004617522"
 	sender = (conversation.get("meta") or {}).get("sender") or {}
 	phone = sender.get("phone_number")
 	if phone:
-		return phone
+		return str(phone)
 	return None
+
+
+def _extract_message_and_conversation(payload: dict):
+	"""Support message nested under \"message\" or flat webhook body."""
+	msg = payload.get("message")
+	if not isinstance(msg, dict):
+		if payload.get("content") is not None or payload.get("conversation_id") is not None:
+			msg = payload
+		else:
+			msg = {}
+	conversation = payload.get("conversation") or {}
+	if not conversation and isinstance(msg.get("conversation"), dict):
+		conversation = msg["conversation"]
+	return msg, conversation
+
+
+def _chat_list_recipient(reference_doctype: str, reference_name: str) -> str | None:
+	"""User who receives WaChatList updates: telecaller (CRM Lead) or deal_owner (CRM Deal)."""
+	if reference_doctype == "CRM Lead":
+		u = frappe.db.get_value("CRM Lead", reference_name, "telecaller")
+	else:
+		return None
+	if u and u != "Guest":
+		return u
+	return None
+
+
+def _list_display_name(reference_doctype: str, reference_name: str, phone: str | None) -> str:
+	if reference_doctype == "CRM Lead":
+		title = frappe.db.get_value("CRM Lead", reference_name, "lead_name")
+		return (title or reference_name or phone or "Chat").strip()
+	if reference_doctype == "CRM Deal":
+		title = frappe.db.get_value("CRM Deal", reference_name, "organization")
+		return (title or reference_name or phone or "Chat").strip()
+	return (reference_name or phone or "Chat").strip()
+
+
+def _build_chat_list_patch(payload: dict, phone: str | None) -> dict | None:
+	msg, conversation = _extract_message_and_conversation(payload)
+	conv_id = conversation.get("id")
+	if conv_id is None:
+		conv_id = msg.get("conversation_id")
+	if conv_id is None:
+		return None
+
+	inbox_id = conversation.get("inbox_id") or msg.get("inbox_id")
+	list_meta = _chatwoot_message_list_meta(msg)
+	preview = list_meta.get("preview") or ""
+	last_thumb = list_meta.get("thumb_url")
+
+	created_at = msg.get("updated_at") or msg.get("created_at")
+	last_at = _format_chat_list_timestamp(created_at) if created_at else ""
+	if not last_at:
+		last_at = frappe.utils.format_datetime(frappe.utils.now_datetime())
+
+	# Chatwoot message_type: 0 = incoming, 1 = outgoing
+	message_type = msg.get("message_type")
+	if message_type == 0 or message_type == "incoming":
+		is_incoming = True
+	elif message_type == 1 or message_type == "outgoing":
+		is_incoming = False
+	else:
+		# webhook event message_created is usually a new message; treat unknown as incoming for unread
+		is_incoming = True
+
+	meta = conversation.get("meta") or {}
+	sender = meta.get("sender") or {}
+	avatar_url = (sender.get("thumbnail") or "").strip() or None
+
+	return {
+		"conversation_id": conv_id,
+		"inbox_id": inbox_id,
+		"phone_number": phone or sender.get("phone_number") or "",
+		"last_message": preview,
+		"last_message_at": last_at,
+		"last_message_thumb": last_thumb,
+		"is_incoming": is_incoming,
+		"unread_increment": 1 if is_incoming else 0,
+		"avatar_url": avatar_url,
+	}
+
+
+def maybe_assign_telecaller_to_lead(inbox_id, lead_id):
+	"""Pick a telecaller from Carrum inbox users and set CRM Lead.telecaller. Returns Frappe username or None."""
+	users = [u for u in get_users_by_inbox_id(inbox_id) if u and str(u).strip()]
+	if not users:
+		log.info(
+			"maybe_assign_telecaller_to_lead: no users for inbox_id=%s lead=%s",
+			inbox_id,
+			lead_id,
+		)
+		return None
+	assignable_telecaller = users[random.randint(0, len(users) - 1)]
+	frappe.db.set_value("CRM Lead", lead_id, "telecaller", assignable_telecaller)
+	return assignable_telecaller
+
+
 
 def _resolve_reference_and_emit_whatsapp_message():
 	"""
-	Resolve reference_doctype and reference_name from webhook payload using phone number,
-	then emit socket event whatsapp_message so the CRM UI can refresh the WhatsApp list.
+	Emit two realtime events:
+	
+	- whatsapp_message_list → single user (telecaller / deal_owner) with chat_list payload for WaChatList.
+	- whatsapp_message → CRM Lead / CRM Deal document room (subscribers viewing that doc in desk/SPA).
 	"""
-	try:
-		from crm.integrations.api import get_contact_lead_or_deal_from_number
-	except ImportError:
-		return
 
-	phone = _get_phone_from_payload(frappe.form_dict or {})
+	payload = _get_chatwoot_webhook_payload()
+	phone = _get_phone_from_payload(payload)
 	if not phone:
 		return
-	reference_name, reference_doctype = get_contact_lead_or_deal_from_number(phone)
-	if not reference_name or not reference_doctype:
+
+	source = frappe.db.get_value("CRM Lead Source", {'is_whatsapp_source': 1}, 'source_name')
+	if not source:
+		log.info("No WhatsApp source found")
 		return
-	frappe.publish_realtime(
-		"whatsapp_message",
-		{
-			"reference_doctype": reference_doctype,
-			"reference_name": reference_name,
-		},
-	)
+	
+	reference_doc = findOrCreateLead(mobileNo=phone, source=source)
+	reference_doctype = "CRM Lead"
+	if not reference_doc:
+		log.info("findOrCreateLead failed for phone: %s", phone)
+		return
+
+	msg, conversation = _extract_message_and_conversation(payload)
+	inbox_id = conversation.get("inbox_id") or msg.get("inbox_id")
+	conv_id_raw = conversation.get("id")
+	if conv_id_raw is None:
+		conv_id_raw = msg.get("conversation_id")
+
+	telecaller_user = None
+	deal_owner = None
+	
+	if reference_doc.doctype == "CRM Lead":
+		lead_type = reference_doc.lead_type
+		telecaller_user = reference_doc.telecaller
+		unassigned = not telecaller_user or str(telecaller_user).strip() in ("", "Guest")
+		print("lead_type :", lead_type)
+		if lead_type == EnumValues.LeadType.LEAD and unassigned and inbox_id is not None:
+			try:
+				inbox_int = int(inbox_id)
+			except (TypeError, ValueError):
+				inbox_int = None
+			if inbox_int is not None:
+				
+				assigned = maybe_assign_telecaller_to_lead(inbox_int, reference_doc.name)
+				telecaller_user = reference_doc.telecaller
+
+				if assigned and conv_id_raw is not None:
+					try:
+						conv_int = int(conv_id_raw)
+					except (TypeError, ValueError):
+						conv_int = None
+					if conv_int is not None:
+						ok = assign_chatwoot_conversation_to_frappe_user(assigned, conv_int)
+						print("Ok: ",ok)
+						if ok:
+							log.info(
+								"Assigned Chatwoot conversation %s to telecaller %s for lead %s",
+								conv_int,
+								assigned,
+								reference_doc.name,
+							)
+	elif reference_doctype == "CRM Deal":
+		deal_owner = frappe.db.get_value("CRM Deal", reference_doc.name, "deal_owner")
+
+	chat_list = _build_chat_list_patch(payload, phone)
+
+	if chat_list is not None:
+		chat_list["display_name"] = _list_display_name(
+			reference_doctype, reference_doc.name, chat_list.get("phone_number") or phone
+		)
+
+	message_detail = {
+		"reference_doctype": reference_doctype,
+		"reference_name": reference_doc.name,
+	}
+	if telecaller_user is not None:
+		message_detail["telecaller"] = telecaller_user
+	if deal_owner is not None:
+		message_detail["deal_owner"] = deal_owner
+
+	conv_id = None
+	if chat_list and chat_list.get("conversation_id") is not None:
+		conv_id = chat_list.get("conversation_id")
+	else:
+		msg, conversation = _extract_message_and_conversation(payload)
+		conv_id = (conversation or {}).get("id")
+		if conv_id is None and isinstance(msg, dict):
+			conv_id = msg.get("conversation_id")
+	
+	if conv_id is not None:
+		message_detail["conversation_id"] = conv_id
+
+	message_list = {**message_detail, "chat_list": chat_list}
+
+	list_user = _chat_list_recipient(reference_doctype, reference_doc.name)
+
+	if list_user:
+		frappe.publish_realtime("whatsapp_message_list", message_list, user=list_user)
+
+	# CRM Lead: user-targeted whatsapp_message for active thread viewers; else doc room fallback
+	if (
+		reference_doctype == "CRM Lead"
+		and message_detail.get("conversation_id") is not None
+	):
+		viewer_users = get_active_viewer_users(message_detail["conversation_id"])
+		if viewer_users:
+			for u in viewer_users:
+				if u and u != "Guest":
+					frappe.publish_realtime("whatsapp_message", message_detail, user=u)
+		else:
+			frappe.publish_realtime(
+				"whatsapp_message",
+				message_detail,
+				doctype="CRM Lead",
+				docname=reference_doc.name,
+			)
+	else:
+		frappe.publish_realtime(
+			"whatsapp_message",
+			message_detail,
+			doctype="CRM Lead",
+			docname=reference_doc.name,
+		)
+
+	frappe.db.commit()
+	return True
 
 
 @frappe.whitelist()
@@ -45,46 +274,50 @@ def conversation_created():
 	'''Register this webhook on chatwoot to handle conversation_created event'''
 	return {}
 
+
 @frappe.whitelist()
 def conversation_status_changed():
 	'''Register this webhook on chatwoot to handle conversation_status_changed event'''
 	return {}
+
 
 @frappe.whitelist()
 def conversation_updated():
 	'''Register this webhook on chatwoot to handle conversation_updated event'''
 	return {}
 
+
 @frappe.whitelist(allow_guest=True)
 def message_created():
-	'''Register this webhook on chatwoot to handle message_created event. Emits whatsapp_message socket event for CRM.'''
-	frappe.logger().info("Chatwoot webhook hit: message_created")
+	'''Chatwoot message_created: emits whatsapp_message_list (owner) and whatsapp_message (doc room).'''
+	log.info("Chatwoot webhook hit: message_created")
 	_resolve_reference_and_emit_whatsapp_message()
 	return "message_created"
 
+
 @frappe.whitelist(allow_guest=True)
 def message_updated():
-	'''Register this webhook on chatwoot to handle message_updated event. Emits whatsapp_message socket event for CRM.'''
-	frappe.logger().info("Chatwoot webhook hit: message_updated")
+	'''Chatwoot message_updated: emits whatsapp_message_list (owner) and whatsapp_message (doc room).'''
+	log.info("Chatwoot webhook hit: message_updated")
 	_resolve_reference_and_emit_whatsapp_message()
 	return {
-        "message": "message_updated"
-    }
+		"message": "message_updated",
+	}
+
 
 @frappe.whitelist()
 def contact_created():
-    '''Register this webhook on chatwoot to handle contact_created event'''
-    return {}
+	'''Register this webhook on chatwoot to handle contact_created event'''
+	return {}
+
 
 @frappe.whitelist()
 def contact_updated():
-    '''Register this webhook on chatwoot to handle contact_updated event'''
-    return {}
+	'''Register this webhook on chatwoot to handle contact_updated event'''
+	return {}
+
 
 @frappe.whitelist()
 def webwidget_triggered():
-    '''Register this webhook on chatwoot to handle webwidget_triggered event'''
-    return {}
-
-
-
+	'''Register this webhook on chatwoot to handle webwidget_triggered event'''
+	return {}
