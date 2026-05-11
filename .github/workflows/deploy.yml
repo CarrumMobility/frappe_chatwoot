@@ -1,25 +1,23 @@
 # Auto-deploy trigger for frappe_chatwoot app
-# When code is pushed to main, triggers a golden AMI build in Devops-Scripts.
-# The AMI build pipeline pulls ALL apps at latest main, builds assets,
-# creates a new AMI, and triggers a rolling ASG instance refresh.
+# When code is pushed to main, triggers a rolling deploy in Devops-Scripts.
 #
 # Required secret: DEPLOY_DISPATCH_TOKEN (GitHub PAT with repo scope
 # on CarrumMobility/Devops-Scripts to trigger repository_dispatch)
-name: Trigger ERPNext AMI Build
+name: Trigger ERPNext v3 Deploy
 
 on:
   push:
     branches: [main]
 
 jobs:
-  trigger-ami-build:
-    name: Trigger AMI build (dev)
+  trigger-deploy:
+    name: Trigger rolling deploy (dev)
     runs-on: ubuntu-latest
     steps:
-      - name: Dispatch AMI build event
+      - name: Dispatch deploy event
         uses: peter-evans/repository-dispatch@v3
         with:
           token: ${{ secrets.DEPLOY_DISPATCH_TOKEN }}
           repository: CarrumMobility/Devops-Scripts
-          event-type: build-erpnext-ami
+          event-type: deploy-erpnext-v3
           client-payload: '{"app": "frappe_chatwoot", "environment": "dev"}'
