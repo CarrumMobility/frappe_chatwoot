@@ -1,9 +1,9 @@
 # Auto-deploy trigger for frappe_chatwoot app
-# When code is pushed to main, dispatches a deploy event to Devops-Scripts.
+# When code is pushed to main, triggers a rolling deploy in Devops-Scripts.
 #
 # Required secret: DEPLOY_DISPATCH_TOKEN (GitHub PAT with repo scope
 # on CarrumMobility/Devops-Scripts to trigger repository_dispatch)
-name: Trigger ERPNext Deploy
+name: Trigger ERPNext v3 Deploy
 
 on:
   push:
@@ -11,7 +11,7 @@ on:
 
 jobs:
   trigger-deploy:
-    name: Trigger deploy to dev
+    name: Trigger rolling deploy (dev)
     runs-on: ubuntu-latest
     steps:
       - name: Dispatch deploy event
@@ -19,5 +19,5 @@ jobs:
         with:
           token: ${{ secrets.DEPLOY_DISPATCH_TOKEN }}
           repository: CarrumMobility/Devops-Scripts
-          event-type: deploy-erpnext
+          event-type: deploy-erpnext-v3
           client-payload: '{"app": "frappe_chatwoot", "environment": "dev"}'
