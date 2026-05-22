@@ -1,6 +1,6 @@
 import logging
 
-from core.api.carrum_accounts import get_users_by_inbox_id
+from core.api.carrum_accounts import get_hub_telecaller_usernames
 from core.constants.enums import EnumValues
 import frappe
 import random
@@ -23,13 +23,15 @@ def _get_chatwoot_webhook_payload() -> dict:
 	req = frappe.request
 	data = req.get_json(silent=True)
 	if isinstance(data, dict) and data:
-		return data
-	return dict(frappe.form_dict or {})
+		payload = data
+	else:
+		payload = dict(frappe.form_dict or {})
+	log.info("Chatwoot webhook payload: %s", payload)
+	return payload
 
 
 def _get_phone_from_payload(payload):
 	"""Extract phone number from Chatwoot webhook payload."""
-	log.info("Payload: " + str(payload))
 	conversation = payload.get("conversation") or {}
 	# contact_inbox.source_id e.g. "917004617522"
 	source_id = (conversation.get("contact_inbox") or {}).get("source_id")
@@ -41,6 +43,12 @@ def _get_phone_from_payload(payload):
 	if phone:
 		return str(phone)
 	return None
+
+
+def _get_inbox_id_from_payload(payload: dict):
+	"""Extract Chatwoot inbox id from nested or flat webhook payload."""
+	msg, conversation = _extract_message_and_conversation(payload)
+	return conversation.get("inbox_id") or msg.get("inbox_id") or payload.get("inbox_id")
 
 
 def _extract_message_and_conversation(payload: dict):
@@ -123,16 +131,29 @@ def _build_chat_list_patch(payload: dict, phone: str | None) -> dict | None:
 	}
 
 
-def maybe_assign_telecaller_to_lead(inbox_id, lead_id):
-	"""Pick a telecaller from Carrum inbox users and set CRM Lead.telecaller. Returns Frappe username or None."""
-	users = [u for u in get_users_by_inbox_id(inbox_id) if u and str(u).strip()]
-	if not users:
-		log.info(
-			"maybe_assign_telecaller_to_lead: no users for inbox_id=%s lead=%s",
-			inbox_id,
-			lead_id,
-		)
+def _get_inbound_lead_source_for_inbox(inbox_id) -> dict | None:
+	"""Return inbound CRM Lead Source mapped to a Chatwoot inbox id."""
+	if inbox_id is None or str(inbox_id).strip() == "":
 		return None
+
+	source = frappe.db.get_value(
+		EnumValues.ReferenceDocType.LEAD_SOURCE,
+		{
+			"chatwoot_inbox_id": str(inbox_id).strip(),
+			"purpose": EnumValues.LeadSourcePurpose.Inbound,
+		},
+		["name", "source_name"],
+		as_dict=True,
+	)
+	if not source:
+		log.info("No inbound CRM Lead Source mapped for inbox_id=%s", inbox_id)
+		return None
+	return source
+
+
+def maybe_assign_telecaller_to_lead(hubId, lead_id):
+	"""Pick a telecaller from Carrum hub users and set CRM Lead.telecaller. Returns Frappe username or None."""
+	users = get_hub_telecaller_usernames(hubId)
 	assignable_telecaller = users[random.randint(0, len(users) - 1)]
 	frappe.db.set_value("CRM Lead", lead_id, "telecaller", assignable_telecaller)
 	return assignable_telecaller
@@ -152,31 +173,37 @@ def _resolve_reference_and_emit_whatsapp_message():
 	if not phone:
 		return
 
-	source = frappe.db.get_value("CRM Lead Source", {'is_whatsapp_source': 1}, 'source_name')
-	if not source:
-		log.info("No WhatsApp source found")
-		return
-	
-	reference_doc = findOrCreateLead(mobileNo=phone, source=source)
-	reference_doctype = "CRM Lead"
+	msg, conversation = _extract_message_and_conversation(payload)
+	inbox_id = _get_inbox_id_from_payload(payload)
+	source_detail = _get_inbound_lead_source_for_inbox(inbox_id)
+	reference_doc = None
+	hubId = None
+	if source_detail:
+		reference_doc = findOrCreateLead(
+			mobileNo=phone,
+			source=source_detail.get("source_name"),
+			source_id=source_detail.get("name"),
+		)
+		hubId = source_detail.get("hub_id")
+	else:
+		reference_doc = findOrCreateLead(mobileNo=phone)
+
+	reference_doctype = EnumValues.ReferenceDocType.CRM_LEAD
 	if not reference_doc:
 		log.info("findOrCreateLead failed for phone: %s", phone)
 		return
 
-	msg, conversation = _extract_message_and_conversation(payload)
-	inbox_id = conversation.get("inbox_id") or msg.get("inbox_id")
 	conv_id_raw = conversation.get("id")
 	if conv_id_raw is None:
 		conv_id_raw = msg.get("conversation_id")
 
 	telecaller_user = None
 	deal_owner = None
-	
 	if reference_doc.doctype == "CRM Lead":
 		lead_type = reference_doc.lead_type
 		telecaller_user = reference_doc.telecaller
 		unassigned = not telecaller_user or str(telecaller_user).strip() in ("", "Guest")
-		print("lead_type :", lead_type)
+
 		if lead_type == EnumValues.LeadType.LEAD and unassigned and inbox_id is not None:
 			try:
 				inbox_int = int(inbox_id)
@@ -184,7 +211,7 @@ def _resolve_reference_and_emit_whatsapp_message():
 				inbox_int = None
 			if inbox_int is not None:
 				
-				assigned = maybe_assign_telecaller_to_lead(inbox_int, reference_doc.name)
+				assigned = maybe_assign_telecaller_to_lead(hubId, reference_doc.name)
 				telecaller_user = reference_doc.telecaller
 
 				if assigned and conv_id_raw is not None:
@@ -272,18 +299,24 @@ def _resolve_reference_and_emit_whatsapp_message():
 @frappe.whitelist()
 def conversation_created():
 	'''Register this webhook on chatwoot to handle conversation_created event'''
+	log.info("Chatwoot webhook hit: conversation_created")
+	_get_chatwoot_webhook_payload()
 	return {}
 
 
 @frappe.whitelist()
 def conversation_status_changed():
 	'''Register this webhook on chatwoot to handle conversation_status_changed event'''
+	log.info("Chatwoot webhook hit: conversation_status_changed")
+	_get_chatwoot_webhook_payload()
 	return {}
 
 
 @frappe.whitelist()
 def conversation_updated():
 	'''Register this webhook on chatwoot to handle conversation_updated event'''
+	log.info("Chatwoot webhook hit: conversation_updated")
+	_get_chatwoot_webhook_payload()
 	return {}
 
 
@@ -308,16 +341,22 @@ def message_updated():
 @frappe.whitelist()
 def contact_created():
 	'''Register this webhook on chatwoot to handle contact_created event'''
+	log.info("Chatwoot webhook hit: contact_created")
+	_get_chatwoot_webhook_payload()
 	return {}
 
 
 @frappe.whitelist()
 def contact_updated():
 	'''Register this webhook on chatwoot to handle contact_updated event'''
+	log.info("Chatwoot webhook hit: contact_updated")
+	_get_chatwoot_webhook_payload()
 	return {}
 
 
 @frappe.whitelist()
 def webwidget_triggered():
 	'''Register this webhook on chatwoot to handle webwidget_triggered event'''
+	log.info("Chatwoot webhook hit: webwidget_triggered")
+	_get_chatwoot_webhook_payload()
 	return {}
