@@ -167,7 +167,19 @@ def _resolve_reference_and_emit_whatsapp_message():
 	- whatsapp_message_list → single user (telecaller / deal_owner) with chat_list payload for WaChatList.
 	- whatsapp_message → CRM Lead / CRM Deal document room (subscribers viewing that doc in desk/SPA).
 	"""
+	try:
+		return _resolve_reference_and_emit_whatsapp_message_impl()
+	except Exception:
+		frappe.db.rollback()
+		log.exception("Failed to process Chatwoot webhook message")
+		frappe.log_error(
+			frappe.get_traceback(),
+			"Chatwoot webhook message processing failed",
+		)
+		return False
 
+
+def _resolve_reference_and_emit_whatsapp_message_impl():
 	payload = _get_chatwoot_webhook_payload()
 	phone = _get_phone_from_payload(payload)
 	if not phone:
