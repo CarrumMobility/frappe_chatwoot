@@ -1,6 +1,6 @@
 import logging
 
-from core.api.carrum_accounts import get_users_by_inbox_id
+from core.api.carrum_accounts import get_hub_telecaller_usernames
 from core.constants.enums import EnumValues
 import frappe
 import random
@@ -151,16 +151,9 @@ def _get_inbound_lead_source_for_inbox(inbox_id) -> dict | None:
 	return source
 
 
-def maybe_assign_telecaller_to_lead(inbox_id, lead_id):
-	"""Pick a telecaller from Carrum inbox users and set CRM Lead.telecaller. Returns Frappe username or None."""
-	users = [u for u in get_users_by_inbox_id(inbox_id) if u and str(u).strip()]
-	if not users:
-		log.info(
-			"maybe_assign_telecaller_to_lead: no users for inbox_id=%s lead=%s",
-			inbox_id,
-			lead_id,
-		)
-		return None
+def maybe_assign_telecaller_to_lead(hubId, lead_id):
+	"""Pick a telecaller from Carrum hub users and set CRM Lead.telecaller. Returns Frappe username or None."""
+	users = get_hub_telecaller_usernames(hubId)
 	assignable_telecaller = users[random.randint(0, len(users) - 1)]
 	frappe.db.set_value("CRM Lead", lead_id, "telecaller", assignable_telecaller)
 	return assignable_telecaller
@@ -184,12 +177,14 @@ def _resolve_reference_and_emit_whatsapp_message():
 	inbox_id = _get_inbox_id_from_payload(payload)
 	source_detail = _get_inbound_lead_source_for_inbox(inbox_id)
 	reference_doc = None
+	hubId = None
 	if source_detail:
 		reference_doc = findOrCreateLead(
 			mobileNo=phone,
 			source=source_detail.get("source_name"),
 			source_id=source_detail.get("name"),
 		)
+		hubId = source_detail.get("hub_id")
 	else:
 		reference_doc = findOrCreateLead(mobileNo=phone)
 
@@ -216,7 +211,7 @@ def _resolve_reference_and_emit_whatsapp_message():
 				inbox_int = None
 			if inbox_int is not None:
 				
-				assigned = maybe_assign_telecaller_to_lead(inbox_int, reference_doc.name)
+				assigned = maybe_assign_telecaller_to_lead(hubId, reference_doc.name)
 				telecaller_user = reference_doc.telecaller
 
 				if assigned and conv_id_raw is not None:
