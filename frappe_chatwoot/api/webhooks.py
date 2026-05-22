@@ -253,13 +253,24 @@ def _resolve_reference_and_emit_whatsapp_message_impl():
 					except (TypeError, ValueError):
 						conv_int = None
 					if conv_int is not None:
-						ok = assign_chatwoot_conversation_to_frappe_user(assigned, conv_int)
-						if ok:
-							log.info(
-								"Assigned Chatwoot conversation %s to telecaller %s for lead %s",
+						try:
+							ok = assign_chatwoot_conversation_to_frappe_user(assigned, conv_int)
+							if ok:
+								log.info(
+									"Assigned Chatwoot conversation %s to telecaller %s for lead %s",
+									conv_int,
+									assigned,
+									reference_doc.name,
+								)
+						except Exception:
+							log.exception("Failed to assign Chatwoot conversation %s to telecaller %s for lead %s",
 								conv_int,
 								assigned,
 								reference_doc.name,
+							)
+							frappe.log_error(
+								frappe.get_traceback(),
+								"Failed to assign Chatwoot conversation to telecaller",
 							)
 	elif reference_doctype == "CRM Deal":
 		deal_owner = frappe.db.get_value("CRM Deal", reference_doc.name, "deal_owner")
