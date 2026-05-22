@@ -7,6 +7,7 @@ import random
 from frappe_chatwoot.api.whatsapp import (
 	_chatwoot_message_list_meta,
 	_format_chat_list_timestamp,
+	_get_chatwoot_ctx,
 	assign_chatwoot_conversation_to_frappe_user,
 )
 from frappe_chatwoot.api.whatsapp_viewers import get_active_viewer_users
@@ -159,6 +160,18 @@ def maybe_assign_telecaller_to_lead(hubId, lead_id):
 	return assignable_telecaller
 
 
+def _chatwoot_ctx_matches_conversation_inbox(username: str | None, conversation_inbox_id) -> bool:
+	if not username or conversation_inbox_id is None:
+		return False
+	ctx = _get_chatwoot_ctx(username)
+	if not ctx:
+		return False
+	ctx_inbox_id = ctx.get("inbox_id")
+	if ctx_inbox_id is None:
+		return False
+	return str(ctx_inbox_id).strip() == str(conversation_inbox_id).strip()
+
+
 
 def _resolve_reference_and_emit_whatsapp_message():
 	"""
@@ -208,6 +221,7 @@ def _resolve_reference_and_emit_whatsapp_message_impl():
 	conv_id_raw = conversation.get("id")
 	if conv_id_raw is None:
 		conv_id_raw = msg.get("conversation_id")
+	conversation_inbox_id = conversation.get("inbox_id")
 
 	telecaller_user = None
 	deal_owner = None
@@ -226,14 +240,20 @@ def _resolve_reference_and_emit_whatsapp_message_impl():
 				assigned = maybe_assign_telecaller_to_lead(hubId, reference_doc.name)
 				telecaller_user = reference_doc.telecaller
 
-				if assigned and conv_id_raw is not None:
+				if (
+					assigned
+					and conv_id_raw is not None
+					and _chatwoot_ctx_matches_conversation_inbox(
+						assigned,
+						conversation_inbox_id,
+					)
+				):
 					try:
 						conv_int = int(conv_id_raw)
 					except (TypeError, ValueError):
 						conv_int = None
 					if conv_int is not None:
 						ok = assign_chatwoot_conversation_to_frappe_user(assigned, conv_int)
-						print("Ok: ",ok)
 						if ok:
 							log.info(
 								"Assigned Chatwoot conversation %s to telecaller %s for lead %s",
