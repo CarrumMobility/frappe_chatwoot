@@ -327,22 +327,21 @@ def get_whatsapp_messages(reference_doctype: str, reference_name: str):
     if not lead_phone_number:
         return _empty_whatsapp_messages_payload(False)
 
-    contactInfo = get_or_create_contact(lead_phone_number, ctx)
-    conversations = get_conversation(contactInfo["contact_id"], ctx)
-
-    if not conversations or len(conversations) == 0:
+    try:
+        thread = _resolve_whatsapp_thread(lead_phone_number, ctx, create_if_missing=False)
+    except Exception as e:
+        log.error(f"Error resolving WhatsApp thread for {reference_name}: {e}")
         return _empty_whatsapp_messages_payload(False)
 
-    conversations = _conversations_for_inbox(conversations, ctx["inbox_id"])
-    if not conversations:
+    if not thread["conversation_id"]:
         return _empty_whatsapp_messages_payload(False)
 
-    primary_conv = conversations[0]
-    can_reply = _conversation_can_reply(primary_conv)
+    contactInfo = thread["contact_info"]
+    can_reply = thread["can_reply"]
 
     all_messages = []
     lastMsgId = None
-    conversation_id = primary_conv.get("id")
+    conversation_id = thread["conversation_id"]
     if conversation_id:
         while True:
             raw_messages = get_messages(conversation_id, ctx, before_msg_id=lastMsgId)
@@ -380,27 +379,16 @@ def create_whatsapp_message(
     content_type: str = "text",
 ):
     """Find or create contact and conversation by phone/inbox, then send the message in that thread."""
-    phone_no = _sanitize_phone(to)
     ctx = _get_chatwoot_ctx()
     if ctx is None:
         frappe.throw("Chatwoot is not configured for this user. Check Carrum chatwoot credentials.")
 
-    contact_info = get_or_create_contact(phone_no, ctx)
-    conversation_id = get_or_create_conversation(
-        contact_id=contact_info["contact_id"],
-        inbox_id=contact_info["inbox_id"],
-        source_id=contact_info["source_id"],
-        ctx=ctx,
-        initial_message=None,
-        phone_number=phone_no,
-    )
-
-    conversations = get_conversation(contact_info["contact_id"], ctx) or []
-    conv = _find_conversation_by_id(conversations, conversation_id)
-    can_reply = _conversation_can_reply(conv)
-    if conv is not None and not can_reply:
+    thread = _resolve_whatsapp_thread(to, ctx, create_if_missing=True)
+    if thread["conversation"] is not None and not thread["can_reply"]:
         frappe.throw(_("Send a template message to resume the conversation"))
 
+    contact_info = thread["contact_info"]
+    conversation_id = thread["conversation_id"]
     msg_response = send_message(conversation_id, message, ctx, attach=(attach or "").strip() or None)
 
     return {
@@ -408,7 +396,7 @@ def create_whatsapp_message(
         "inbox_id": contact_info["inbox_id"],
         "source_id": contact_info["source_id"],
         "conversation_id": conversation_id,
-        "can_reply": can_reply,
+        "can_reply": thread["can_reply"],
         "message": msg_response,
     }
 
@@ -443,7 +431,8 @@ def send_whatsapp_template(
     elif body_params == "":
         body_params = None
 
-    template_info = get_template_info(template, ctx)
+    inbox_id = ctx.get("inbox_id")
+    template_info = get_template_info(template, ctx, inbox_id=inbox_id)
     all_var_indices = template_info.get("all_variable_indices") or template_info.get(
         "body_variable_indices", []
     )
@@ -471,16 +460,9 @@ def send_whatsapp_template(
     if processed == {} and not all_var_indices:
         processed = None  # use legacy { body: body_params } in send_template_message
 
-    phone_no = _sanitize_phone(to)
-    contact_info = get_or_create_contact(phone_no, ctx)
-    conversation_id = get_or_create_conversation(
-        contact_id=contact_info["contact_id"],
-        inbox_id=contact_info["inbox_id"],
-        source_id=contact_info["source_id"],
-        initial_message=None,
-        ctx=ctx,
-        phone_number=phone_no,
-    )
+    thread = _resolve_whatsapp_thread(to, ctx, create_if_missing=True)
+    contact_info = thread["contact_info"]
+    conversation_id = thread["conversation_id"]
     msg_response = send_template_message(
         conversation_id=conversation_id,
         template_name=template,
@@ -496,6 +478,7 @@ def send_whatsapp_template(
         "inbox_id": contact_info["inbox_id"],
         "source_id": contact_info["source_id"],
         "conversation_id": conversation_id,
+        "can_reply": thread["can_reply"],
         "message": msg_response,
     }
 
@@ -790,12 +773,34 @@ def get_chat_list_by_phoneNumbers(searchKey=None, phoneNumbers=None):
     return {"count": len(rows), "data": rows}
 
 # UTILITY FUNCTIONS
+def _normalize_crm_whatsapp_phone(phone_no: str) -> str:
+    """Normalize CRM / user input to 10-digit national number for India."""
+    raw = (phone_no or "").strip()
+    if not raw:
+        frappe.throw(_("Phone number is required"))
+    digits = _normalize_chatwoot_whatsapp_source_id(raw)
+    if len(digits) == 10:
+        return digits
+    if len(digits) == 12 and digits.startswith("91"):
+        return digits[2:]
+    if len(digits) == 11 and digits.startswith("0"):
+        return digits[1:]
+    if len(digits) > 10:
+        return digits[-10:]
+    raise Exception("Invalid Phone number Length")
+
+
 def _sanitize_phone(phoneNo: str):
-    if len(phoneNo) == 10:
-        return phoneNo
-    if len(phoneNo) < 10:
-        raise Exception("Invalid Phone number Length")
-    return phoneNo.replace("+91", "")
+    return _normalize_crm_whatsapp_phone(phoneNo)
+
+
+def _inbox_ids_match(left, right) -> bool:
+    if left is None or right is None:
+        return False
+    try:
+        return int(str(left).strip()) == int(str(right).strip())
+    except (TypeError, ValueError):
+        return str(left).strip() == str(right).strip()
 
 def _normalize_chatwoot_whatsapp_source_id(value: str | int | None) -> str:
     """
@@ -921,18 +926,27 @@ def assign_whatsapp_inbox_to_contact(contact_id: int, ctx: dict, source_id: str)
     return ci
 
 
+def _contact_inbox_entry_inbox_id(contact_inbox: dict):
+    inbox = contact_inbox.get("inbox") or {}
+    iid = inbox.get("id")
+    if iid is None:
+        iid = contact_inbox.get("inbox_id")
+    return iid
+
+
 def _parse_contact_info(contact: dict, ctx: dict) -> dict:
-    """Extract contact_id, inbox_id, source_id from a contact payload (with contact_inboxes)."""
+    """Extract contact_id, inbox_id, source_id aligned to the user's configured WhatsApp inbox."""
     contact_id = contact["id"]
     contact_inboxes = contact.get("contact_inboxes") or []
-    whatsapp_inbox = next(
-        (
-            ci
-            for ci in contact_inboxes
-            if (ci.get("inbox") or {}).get("channel_type") == "Channel::Whatsapp"
-        ),
-        contact_inboxes[0] if contact_inboxes else None,
-    )
+    want_inbox = ctx.get("inbox_id")
+
+    whatsapp_inbox = None
+    if want_inbox is not None:
+        for ci in contact_inboxes:
+            if _inbox_ids_match(_contact_inbox_entry_inbox_id(ci), want_inbox):
+                whatsapp_inbox = ci
+                break
+
     if not whatsapp_inbox:
         sid = _contact_whatsapp_source_id(contact)
         if not sid:
@@ -940,10 +954,17 @@ def _parse_contact_info(contact: dict, ctx: dict) -> dict:
                 "Contact has no phone_number/identifier; cannot assign WhatsApp inbox"
             )
         whatsapp_inbox = assign_whatsapp_inbox_to_contact(contact_id, ctx, sid)
+
+    try:
+        resolved_inbox_id = int(str(ctx["inbox_id"]).strip())
+    except (TypeError, ValueError, KeyError):
+        resolved_inbox_id = _contact_inbox_entry_inbox_id(whatsapp_inbox)
+
+    source_id = whatsapp_inbox.get("source_id") or _contact_whatsapp_source_id(contact)
     return {
         "contact_id": contact_id,
-        "inbox_id": whatsapp_inbox["inbox"]["id"],
-        "source_id": whatsapp_inbox["source_id"],
+        "inbox_id": resolved_inbox_id,
+        "source_id": source_id,
     }
 
 
@@ -982,6 +1003,7 @@ def get_or_create_contact(
     created. Existing contacts are not renamed. Falls back to ``phone_no`` when not
     provided so we never POST an empty name.
     """
+    phone_no = _normalize_crm_whatsapp_phone(phone_no)
     try:
         return find_contact(phone_no, ctx)
     except Exception as e:
@@ -1030,7 +1052,9 @@ def _sort_conversations_newest_first(conversations: list) -> list:
 
 def _conversations_for_inbox(conversations: list, inbox_id) -> list:
     """Filter by inbox and return newest conversation first (highest id)."""
-    filtered = [c for c in (conversations or []) if c.get("inbox_id") == inbox_id]
+    filtered = [
+        c for c in (conversations or []) if _inbox_ids_match(c.get("inbox_id"), inbox_id)
+    ]
     return _sort_conversations_newest_first(filtered)
 
 
@@ -1049,8 +1073,11 @@ def _find_conversation_by_id(conversations: list, conversation_id: int) -> dict 
     except (TypeError, ValueError):
         return None
     for conv in conversations or []:
-        if conv.get("id") == want:
-            return conv
+        try:
+            if int(conv.get("id")) == want:
+                return conv
+        except (TypeError, ValueError):
+            continue
     return None
 
 
@@ -1162,6 +1189,49 @@ def get_or_create_conversation(
         initial_message,
         phone_number=phone_number,
     )
+
+
+def _resolve_whatsapp_thread(
+    phone_raw: str,
+    ctx: dict,
+    *,
+    create_if_missing: bool = False,
+    contact_name: str | None = None,
+) -> dict:
+    """
+    Resolve contact + newest conversation for the user's configured inbox.
+
+    All WhatsApp read/send paths must use this so they target the same thread.
+    """
+    phone_no = _normalize_crm_whatsapp_phone(phone_raw)
+    contact_info = get_or_create_contact(phone_no, ctx, contact_name=contact_name)
+    inbox_id = contact_info["inbox_id"]
+
+    conversations = get_conversation(contact_info["contact_id"], ctx) or []
+    by_inbox = _conversations_for_inbox(conversations, inbox_id)
+
+    if create_if_missing:
+        conversation_id = get_or_create_conversation(
+            contact_id=contact_info["contact_id"],
+            inbox_id=inbox_id,
+            source_id=contact_info["source_id"],
+            ctx=ctx,
+            initial_message=None,
+            phone_number=phone_no,
+        )
+        refreshed = get_conversation(contact_info["contact_id"], ctx) or []
+        conversation = _find_conversation_by_id(refreshed, conversation_id)
+    else:
+        conversation = by_inbox[0] if by_inbox else None
+        conversation_id = conversation.get("id") if conversation else None
+
+    return {
+        "phone_no": phone_no,
+        "contact_info": contact_info,
+        "conversation": conversation,
+        "conversation_id": conversation_id,
+        "can_reply": _conversation_can_reply(conversation),
+    }
 
 
 MAX_WHATSAPP_ATTACHMENT_BYTES = 40 * 1024 * 1024
