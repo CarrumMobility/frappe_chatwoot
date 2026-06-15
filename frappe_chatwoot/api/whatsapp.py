@@ -13,6 +13,8 @@ import frappe
 import requests
 from frappe import _
 
+log = frappe.logger("frappe_chatwoot:api_whatsapp")
+
 LEAD_DOCTYPE = "CRM Lead"
 DEAL_DOCTYPE = "CRM Deal"
 FRAPPE_CHATWOOT_MESSAGE_TYPE_MAPPING = {1: "Outgoing", 2: "Incoming"}
@@ -311,29 +313,32 @@ def get_whatsapp_messages(reference_doctype: str, reference_name: str):
     ctx = _get_chatwoot_ctx()
     if ctx is None:
         return _empty_whatsapp_messages_payload(False)
+
     try:
         ref_doc = _get_crm_ref_doc_for_whatsapp_thread(
             str(reference_doctype or ""), str(reference_name or "")
         )
-    except Exception:
+    except Exception as e:
+        log.error(f"Error getting CRM reference document for WhatsApp thread: {e}")
         return _empty_whatsapp_messages_payload(False)
+
     lead_phone_number = (ref_doc.get("mobile_no") or "").strip() if ref_doc else ""
+
     if not lead_phone_number:
         return _empty_whatsapp_messages_payload(False)
 
     contactInfo = get_or_create_contact(lead_phone_number, ctx)
     conversations = get_conversation(contactInfo["contact_id"], ctx)
+
     if not conversations or len(conversations) == 0:
         return _empty_whatsapp_messages_payload(False)
 
-    conversations = [c for c in conversations if c.get("inbox_id") == ctx["inbox_id"]]
+    conversations = _conversations_for_inbox(conversations, ctx["inbox_id"])
     if not conversations:
         return _empty_whatsapp_messages_payload(False)
 
     primary_conv = conversations[0]
-    can_reply = primary_conv.get("can_reply")
-    if can_reply is None:
-        can_reply = True
+    can_reply = _conversation_can_reply(primary_conv)
 
     all_messages = []
     lastMsgId = None
@@ -389,10 +394,12 @@ def create_whatsapp_message(
         initial_message=None,
         phone_number=phone_no,
     )
-    conversations = get_conversation(contact_info["contact_id"], ctx)
-    conv = next((c for c in conversations if c.get("id") == conversation_id), None)
-    if conv is not None and conv.get("can_reply") is False:
-        frappe.throw("Send a template message to resume the conversation")
+
+    conversations = get_conversation(contact_info["contact_id"], ctx) or []
+    conv = _find_conversation_by_id(conversations, conversation_id)
+    can_reply = _conversation_can_reply(conv)
+    if conv is not None and not can_reply:
+        frappe.throw(_("Send a template message to resume the conversation"))
 
     msg_response = send_message(conversation_id, message, ctx, attach=(attach or "").strip() or None)
 
@@ -401,6 +408,7 @@ def create_whatsapp_message(
         "inbox_id": contact_info["inbox_id"],
         "source_id": contact_info["source_id"],
         "conversation_id": conversation_id,
+        "can_reply": can_reply,
         "message": msg_response,
     }
 
@@ -1016,6 +1024,36 @@ def get_contact(phone_no: str, ctx: dict) -> dict:
     return data.get("payload", data)
 
 
+def _sort_conversations_newest_first(conversations: list) -> list:
+    return sorted(conversations or [], key=lambda x: x.get("id", 0), reverse=True)
+
+
+def _conversations_for_inbox(conversations: list, inbox_id) -> list:
+    """Filter by inbox and return newest conversation first (highest id)."""
+    filtered = [c for c in (conversations or []) if c.get("inbox_id") == inbox_id]
+    return _sort_conversations_newest_first(filtered)
+
+
+def _conversation_can_reply(conversation: dict | None) -> bool:
+    if not conversation:
+        return True
+    value = conversation.get("can_reply")
+    if value is None:
+        return True
+    return bool(value)
+
+
+def _find_conversation_by_id(conversations: list, conversation_id: int) -> dict | None:
+    try:
+        want = int(conversation_id)
+    except (TypeError, ValueError):
+        return None
+    for conv in conversations or []:
+        if conv.get("id") == want:
+            return conv
+    return None
+
+
 def get_conversation(contact_id: int, ctx: dict) -> list | None:
     """
     List contact conversations; return the first open/pending one for this inbox.
@@ -1047,9 +1085,9 @@ def create_conversation(
     """Create a new conversation for the contact in the given inbox. Returns conversation_id."""
     create_url = f"{ctx['base_url']}/api/v1/accounts/{ctx['account_id']}/conversations"
     body = {"source_id": source_id, "inbox_id": inbox_id, "contact_id": contact_id}
-    pn = (phone_number or "").strip() or (source_id or "").strip()
-    if pn:
-        body["custom_attributes"] = {"phoneNumber": pn}
+    # pn = (phone_number or "").strip() or (source_id or "").strip()
+    # if pn:
+        # body["custom_attributes"] = {"phoneNumber": pn}
     if initial_message:
         body["message"] = {"content": initial_message}
     conv_resp = _chatwoot_api_request(
@@ -1070,7 +1108,7 @@ def find_conversation(contact_id: int, inbox_id: int, ctx: dict) -> dict:
     Returns the conversation dict (includes id, can_reply, etc.). Raises if no conversation found.
     """
     conversations = get_conversation(contact_id, ctx)
-    by_inbox = [c for c in conversations if c.get("inbox_id") == inbox_id]
+    by_inbox = _conversations_for_inbox(conversations, inbox_id)
     if not by_inbox:
         raise Exception("No conversation found for this contact in the given inbox")
     return by_inbox[0]
@@ -1112,7 +1150,8 @@ def get_or_create_conversation(
     Returns conversation_id.
     """
     conversations = get_conversation(contact_id, ctx)
-    by_inbox = [c for c in conversations if c.get("inbox_id") == inbox_id]
+    by_inbox = _conversations_for_inbox(conversations, inbox_id)
+
     if by_inbox:
         return by_inbox[0]["id"]
     return create_conversation(
