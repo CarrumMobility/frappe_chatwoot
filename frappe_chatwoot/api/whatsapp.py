@@ -833,9 +833,36 @@ def _contact_phone_matches_whatsapp_digits(contact: dict, digits: str) -> bool:
     """True if Chatwoot contact phone_number or identifier normalizes to the same WhatsApp digits."""
     if not digits:
         return False
+    target = _normalize_chatwoot_whatsapp_source_id(digits)
+    if not target:
+        return False
     pn = _normalize_chatwoot_whatsapp_source_id(contact.get("phone_number"))
     ident = _normalize_chatwoot_whatsapp_source_id(contact.get("identifier"))
-    return pn == digits or ident == digits
+    candidates = {c for c in (pn, ident) if c}
+    if target in candidates:
+        return True
+    # Match 10-digit national numbers against E.164-style stored values (91XXXXXXXXXX).
+    if len(target) == 10:
+        return any(c == f"91{target}" or c.endswith(target) for c in candidates)
+    if len(target) == 12 and target.startswith("91"):
+        national = target[2:]
+        return any(c == target or c.endswith(national) for c in candidates)
+    return False
+
+
+def _filter_contacts_by_phone(contacts: list, phone_no: str) -> list:
+    """Keep Chatwoot search hits that match the requested WhatsApp phone."""
+    national = _normalize_crm_whatsapp_phone(phone_no)
+    whatsapp_digits = f"91{national}"
+    return [
+        contact
+        for contact in contacts
+        if isinstance(contact, dict)
+        and (
+            _contact_phone_matches_whatsapp_digits(contact, whatsapp_digits)
+            or _contact_phone_matches_whatsapp_digits(contact, national)
+        )
+    ]
 
 
 def _chatwoot_get_contact(contact_id: int, ctx: dict) -> dict:
@@ -972,9 +999,47 @@ def find_contact(phone_no: str, ctx: dict) -> dict:
     """
     Search contact by phone; do not create. Returns contact_id, inbox_id, source_id
     for the WhatsApp channel. Raises if not found or multiple matches.
+
+    Response format of search phone number API:
+    {
+    "meta": {
+        "count": 1,
+        "current_page": "1",
+        "has_more": false
+    },
+    "payload": [
+        {
+            "additional_attributes": {},
+            "availability_status": "offline",
+            "email": null,
+            "id": 4645,
+            "name": "",
+            "phone_number": "+914345678695",
+            "blocked": false,
+            "identifier": null,
+            "thumbnail": "",
+            "custom_attributes": {},
+            "created_at": 1781761572,
+            "contact_inboxes": [
+                {
+                    "source_id": "914345678695",
+                    "inbox": {
+                        "id": 1,
+                        "avatar_url": "",
+                        "channel_id": 1,
+                        "name": "DM Test",
+                        "channel_type": "Channel::Whatsapp",
+                        "provider": "whatsapp_cloud"
+                    }
+                }
+            ]
+        }
+    ]
+}
     """
+    national = _normalize_crm_whatsapp_phone(phone_no)
     search_url = (
-        f"{ctx['base_url']}/api/v1/accounts/{ctx['account_id']}/contacts/search?page=1&q={phone_no}"
+        f"{ctx['base_url']}/api/v1/accounts/{ctx['account_id']}/contacts/search?page=1&q={national}"
     )
     resp = _chatwoot_api_request(
         "GET",
@@ -984,9 +1049,9 @@ def find_contact(phone_no: str, ctx: dict) -> dict:
     )
     resp.raise_for_status()
     data = resp.json()
-    payload = data.get("payload") or []
+    payload = _filter_contacts_by_phone(data.get("payload") or [], national)
     if len(payload) == 0:
-        raise Exception(f"Contact not found for phone {phone_no}")
+        raise Exception(f"Contact not found for phone {national}")
     # if len(payload) > 1:
     #     raise Exception("Multiple contacts found for this phone number")
     return _parse_contact_info(payload[0], ctx)
@@ -1009,8 +1074,11 @@ def get_or_create_contact(
     except Exception as e:
         if "Contact not found" not in str(e):
             raise
-    display_name = (str(contact_name).strip() if contact_name is not None else "") or phone_no
+    
+    display_name = f"FFFFF{phone_no[-5:]}"
+
     create_url = f"{ctx['base_url']}/api/v1/accounts/{ctx['account_id']}/contacts"
+    
     create_resp = _chatwoot_api_request(
         "POST",
         create_url,
@@ -1020,7 +1088,6 @@ def get_or_create_contact(
             "inbox_id": ctx["inbox_id"],
             "phone_number": f"+91{phone_no}",
             "name": display_name,
-            "identifier": phone_no,
         },
     )
     create_resp.raise_for_status()
