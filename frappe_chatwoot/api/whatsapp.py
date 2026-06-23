@@ -99,32 +99,9 @@ def _chatwoot_api_request(
 
 
 def _get_chatwoot_ctx(username: str | None = None) -> dict | None:
-    """Load per-user Chatwoot token and inbox from Carrum; account id and base URL from site config."""
-    user = username or frappe.session.user
-    cfg = carrum_accounts.get_chatwoot_config_by_frappe_user(user)
-    if cfg is None:
-        return None
+    from core.integrations.chatwoot.client import get_chatwoot_ctx
 
-    account_id = frappe.conf.get("chatwoot_account_id")
-    if account_id is None:
-        frappe.throw("Chatwoot account id is not configured (chatwoot_account_id).")
-    base_url = (frappe.conf.get("chatwoot_base_url") or "").rstrip("/")
-    
-    token = (cfg.token or "").strip()
-    if not token:
-        return None
-
-    # Prefer site override; otherwise use inbox from Carrum user credentials.
-    inbox_id = cfg.inboxId
-    agentId = cfg.agentId
-    return {
-        "api_access_token": token,
-        "inbox_id": inbox_id,
-        "account_id": account_id,
-        "base_url": base_url,
-        "agent_id": agentId,
-        "headers": {"api_access_token": token, "Content-Type": "application/json"},
-    }
+    return get_chatwoot_ctx(username)
 
 
 @frappe.whitelist()
@@ -264,12 +241,27 @@ def _chatwoot_api_message_to_crm_whatsapp_row(
     }
 
 
-def _empty_whatsapp_messages_payload(can_reply: bool = False) -> dict:
+def _empty_whatsapp_messages_payload(
+    can_reply: bool = False,
+    contact_id=None,
+    conversation_id=None,
+) -> dict:
     return {
         "messages": [],
         "can_reply": bool(can_reply),
-        "conversation_id": None,
+        "conversation_id": conversation_id,
+        "contact_id": contact_id,
     }
+
+
+def _contact_display_name(ref_doc) -> str | None:
+    if not ref_doc:
+        return None
+    name = (ref_doc.get("lead_name") or "").strip()
+    if not name:
+        parts = [ref_doc.get("first_name"), ref_doc.get("last_name")]
+        name = " ".join(p for p in parts if p).strip()
+    return name or None
 
 
 def _get_crm_ref_doc_for_whatsapp_thread(reference_doctype: str, reference_name: str):
@@ -306,10 +298,17 @@ def get_whatsapp_messages(reference_doctype: str, reference_name: str):
     """
     Return WhatsApp thread messages for a lead plus Chatwoot ``can_reply``.
 
+    Ensures a Chatwoot contact and conversation exist for the lead's phone number
+    and returns ``contact_id`` / ``conversation_id`` even when the thread is empty.
+
     ``can_reply`` comes from the contact's conversation payload (see Chatwoot
     contact conversations API). When false, only template messages can reopen the
     session — mirror that in the desk composer.
     """
+    from crm.api.whatsapp import validate_access
+
+    validate_access(reference_doctype, reference_name)
+
     ctx = _get_chatwoot_ctx()
     if ctx is None:
         return _empty_whatsapp_messages_payload(False)
@@ -328,20 +327,30 @@ def get_whatsapp_messages(reference_doctype: str, reference_name: str):
         return _empty_whatsapp_messages_payload(False)
 
     try:
-        thread = _resolve_whatsapp_thread(lead_phone_number, ctx, create_if_missing=False)
+        thread = _resolve_whatsapp_thread(
+            lead_phone_number,
+            ctx,
+            create_if_missing=True,
+            contact_name=_contact_display_name(ref_doc),
+        )
     except Exception as e:
         log.error(f"Error resolving WhatsApp thread for {reference_name}: {e}")
         return _empty_whatsapp_messages_payload(False)
 
-    if not thread["conversation_id"]:
-        return _empty_whatsapp_messages_payload(False)
-
-    contactInfo = thread["contact_info"]
+    contact_info = thread["contact_info"]
+    contact_id = contact_info["contact_id"]
+    conversation_id = thread["conversation_id"]
     can_reply = thread["can_reply"]
+
+    if not conversation_id:
+        return _empty_whatsapp_messages_payload(
+            can_reply,
+            contact_id=contact_id,
+            conversation_id=None,
+        )
 
     all_messages = []
     lastMsgId = None
-    conversation_id = thread["conversation_id"]
     if conversation_id:
         while True:
             raw_messages = get_messages(conversation_id, ctx, before_msg_id=lastMsgId)
@@ -353,7 +362,7 @@ def get_whatsapp_messages(reference_doctype: str, reference_name: str):
     data = []
     for msg in all_messages:
         row = _chatwoot_api_message_to_crm_whatsapp_row(
-            msg, contactInfo, reference_doctype, reference_name
+            msg, contact_info, reference_doctype, reference_name
         )
         if row:
             data.append(row)
@@ -365,6 +374,7 @@ def get_whatsapp_messages(reference_doctype: str, reference_name: str):
         "messages": data,
         "can_reply": bool(can_reply),
         "conversation_id": conversation_id,
+        "contact_id": contact_id,
     }
 
 
@@ -458,7 +468,7 @@ def send_whatsapp_template(
     if not processed and body_params_dict:
         processed = {"body": body_params_dict}
     if processed == {} and not all_var_indices:
-        processed = None  # use legacy { body: body_params } in send_template_message
+        processed = None  
 
     thread = _resolve_whatsapp_thread(to, ctx, create_if_missing=True)
     contact_info = thread["contact_info"]
