@@ -156,9 +156,16 @@ def maybe_assign_telecaller_to_lead(hubId, lead_id):
 	"""Pick a telecaller from Carrum hub users and set CRM Lead.telecaller. Returns Frappe username or None."""
 	users = get_hub_telecaller_usernames(hubId)
 	assignable_telecaller = users[random.randint(0, len(users) - 1)]
-	frappe.db.set_value("CRM Lead", lead_id, "telecaller", assignable_telecaller)
-	return assignable_telecaller
-
+	# BUG: fix tc assignment logic if again plan to test it, it may have some issue
+	allow_tc_assignment = False
+	if allow_tc_assignment:
+		db_record = frappe.db.get_doc(EnumValues.ReferenceDocType.CRM_LEAD, lead_id)
+		if db_record:
+			db_record.telecaller = assignable_telecaller
+			db_record.save(ignore_permissions=True)
+		return assignable_telecaller
+	else:
+		return None
 
 def _chatwoot_ctx_matches_conversation_inbox(username: str | None, conversation_inbox_id) -> bool:
 	if not username or conversation_inbox_id is None:
