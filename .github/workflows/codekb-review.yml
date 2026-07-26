@@ -1,0 +1,130 @@
+name: codekb review
+
+# Pilot: CarrumMobility/frappe-crm only. Copy this file into that repo's .github/workflows/
+# to activate — it does nothing sitting in code-knowledge-base itself.
+#
+# What it does: on a PR, asks the codekb Cloud Run service for a single-repo code review
+# (correctness / security / performance / completeness / style) and posts the findings as
+# INLINE review comments on the exact lines, plus one summary comment. Advisory only.
+#
+# Auth: Workload Identity Federation (no keys). The WIF binding trusts ONLY
+# CarrumMobility/frappe-crm to assume codekb-gh-caller, which can ONLY invoke the codekb
+# Cloud Run service — nothing else. See docs/review-agent-plan.md.
+#
+# Idempotent: on every re-run (PR synchronize) it deletes its own previous comments first,
+# so updated PRs get a fresh review instead of piling up duplicates.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:            # manual test run against an existing PR number
+    inputs:
+      pr_number:
+        description: "PR number to review"
+        required: true
+
+permissions:
+  id-token: write        # Workload Identity Federation
+  pull-requests: write   # post review comments
+  contents: read
+
+env:
+  CODEKB_URL: https://codekb-rf7ovw7xtq-uc.a.run.app
+
+jobs:
+  codekb-review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Authenticate to GCP (Workload Identity Federation)
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: carrum-agent-pilot-dev
+          workload_identity_provider: projects/249293415389/locations/global/workloadIdentityPools/codekb-gh-pool/providers/codekb-gh-provider
+          service_account: codekb-gh-caller@carrum-agent-pilot-dev.iam.gserviceaccount.com
+          token_format: id_token
+          id_token_audience: ${{ env.CODEKB_URL }}
+          id_token_include_email: true
+
+      - name: Request review from codekb
+        id: review
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number || github.event.inputs.pr_number }}"
+          PAYLOAD=$(jq -n --arg repo "${{ github.repository }}" --argjson pr "$PR_NUMBER" \
+            '{repo: $repo, pr_number: $pr, mode: "general"}')
+
+          RESPONSE=$(curl -sS -w '\n%{http_code}' -X POST "$CODEKB_URL/review" \
+            -H "Authorization: Bearer ${{ steps.auth.outputs.id_token }}" \
+            -H "Content-Type: application/json" \
+            --max-time 290 \
+            -d "$PAYLOAD")
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          echo "$RESPONSE" | sed '$d' > review.json
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "codekb /review failed with HTTP $HTTP_CODE"; cat review.json; exit 1
+          fi
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
+      - name: Post inline review comments
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const data = JSON.parse(fs.readFileSync('review.json', 'utf8'));
+            const { owner, repo } = context.repo;
+            const pull_number = parseInt('${{ steps.review.outputs.pr_number }}');
+            const MARKER = '<!-- codekb-review -->';
+
+            // --- idempotency: remove our own previous comments before re-posting ---
+            const prevInline = await github.paginate(github.rest.pulls.listReviewComments,
+              { owner, repo, pull_number, per_page: 100 });
+            for (const c of prevInline) {
+              if (c.body && c.body.includes(MARKER)) {
+                try { await github.rest.pulls.deleteReviewComment({ owner, repo, comment_id: c.id }); }
+                catch (e) { core.info('skip delete inline ' + c.id + ': ' + e.message); }
+              }
+            }
+            const prevIssue = await github.paginate(github.rest.issues.listComments,
+              { owner, repo, issue_number: pull_number, per_page: 100 });
+            for (const c of prevIssue) {
+              if (c.body && c.body.includes(MARKER)) {
+                try { await github.rest.issues.deleteComment({ owner, repo, comment_id: c.id }); }
+                catch (e) { core.info('skip delete issue ' + c.id + ': ' + e.message); }
+              }
+            }
+
+            const findings = data.findings || [];
+            const pr = await github.rest.pulls.get({ owner, repo, pull_number });
+            const commit_id = pr.data.head.sha;
+
+            // --- inline comments (one per finding, on its exact line) ---
+            const posted = [], failed = [];
+            for (const f of findings) {
+              const conf = f.confidence === 'lower' ? ' · _lower-confidence — verify_' : '';
+              const body = `${MARKER}\n**codekb** · \`${f.severity}\` / ${f.category}${conf}\n\n${f.message}`;
+              try {
+                await github.rest.pulls.createReviewComment({
+                  owner, repo, pull_number, commit_id,
+                  path: f.file, line: f.line, side: 'RIGHT', body,
+                });
+                posted.push(f);
+              } catch (e) {
+                failed.push({ f, err: e.message });
+              }
+            }
+
+            // --- one summary comment ---
+            let out = `${MARKER}\n## 🤖 codekb review\n\n${data.summary || ''}\n\n`;
+            if (!findings.length) {
+              out += 'No issues found. ✅\n';
+            } else {
+              out += `Left **${posted.length}** inline comment(s).\n`;
+              if (failed.length) {
+                out += `\nCould not attach these to a line (not in the diff):\n`;
+                for (const x of failed) out += `- \`${x.f.file}:${x.f.line}\` (${x.f.severity}) — ${x.f.message}\n`;
+              }
+            }
+            out += `\n<sub>Advisory only — verify before acting. Single-repo review; ` +
+                   `cross-repo impact not yet included.</sub>`;
+            await github.rest.issues.createComment({ owner, repo, issue_number: pull_number, body: out });
