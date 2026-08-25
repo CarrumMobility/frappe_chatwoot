@@ -11,7 +11,7 @@ from frappe_chatwoot.api.whatsapp import (
 	assign_chatwoot_conversation_to_frappe_user,
 )
 from frappe_chatwoot.api.whatsapp_viewers import get_active_viewer_users
-from crm.integrations.api import findOrCreateLead
+from crm.integrations.api import findLead
 
 # Frappe's default logger level is WARNING (dev) or ERROR (prod), so INFO never reaches the file.
 # See frappe.utils.logger.default_log_level / get_logger().
@@ -208,21 +208,12 @@ def _resolve_reference_and_emit_whatsapp_message_impl():
 	msg, conversation = _extract_message_and_conversation(payload)
 	inbox_id = _get_inbox_id_from_payload(payload)
 	source_detail = _get_inbound_lead_source_for_inbox(inbox_id)
-	reference_doc = None
-	hubId = None
-	if source_detail:
-		reference_doc = findOrCreateLead(
-			mobileNo=phone,
-			source=source_detail.get("source_name"),
-			source_id=source_detail.get("name"),
-		)
-		hubId = source_detail.get("hub_id")
-	else:
-		reference_doc = findOrCreateLead(mobileNo=phone)
+	hubId = source_detail.get("hub_id") if source_detail else None
+	reference_doc = findLead(mobileNo=phone)
 
 	reference_doctype = EnumValues.ReferenceDocType.CRM_LEAD
 	if not reference_doc:
-		log.info("findOrCreateLead failed for phone: %s", phone)
+		log.info("No CRM Lead found for phone: %s", phone)
 		return
 
 	conv_id_raw = conversation.get("id")
@@ -243,7 +234,7 @@ def _resolve_reference_and_emit_whatsapp_message_impl():
 			except (TypeError, ValueError):
 				inbox_int = None
 			if inbox_int is not None:
-				
+
 				assigned = maybe_assign_telecaller_to_lead(hubId, reference_doc.name)
 				telecaller_user = reference_doc.telecaller
 
